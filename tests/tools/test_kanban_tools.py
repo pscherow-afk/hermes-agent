@@ -2430,3 +2430,84 @@ def test_create_no_context_no_notify_is_noop(monkeypatch, worker_env):
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
     assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_create_resolves_profile_from_hermes_home_when_hermes_profile_unset(monkeypatch, worker_env, tmp_path):
+    """Root-cause fix for t_18688c49: inside a gateway worker the profile is
+    known from HERMES_HOME (the launcher exports it from ``--profile <name>``),
+    but HERMES_PROFILE / HERMES_SESSION_PROFILE are NOT exported. The
+    notifier_profile MUST be resolved from HERMES_HOME via
+    get_active_profile_name(), otherwise the watcher emits notifier_profile=NULL
+    and can't pick a bot -> silent skip / cross-profile mis-delivery.
+
+    This test simulates a Heisenberg gateway worker:
+      - HERMES_SESSION_PLATFORM + HERMES_SESSION_CHAT_ID set (live worker)
+      - HERMES_PROFILE / HERMES_SESSION_PROFILE UNSET (the real gateway bug)
+      - HERMES_HOME = <root>/profiles/heisenberg (what the launcher exports)
+    and asserts the subscription carries notifier_profile='heisenberg'.
+    """
+    from tools import kanban_tools as kt
+
+    # No explicit profile env — this is exactly what's missing in the gateway.
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+
+    # Simulate the launcher's HERMES_HOME export for `--profile heisenberg`.
+    # Path math in get_active_profile_name() only needs the *shape*
+    # <root>/profiles/<name>; no real dir needs to exist.
+    hermes_home = tmp_path / "fake_root" / "profiles" / "heisenberg"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    # Live worker session context (platform + chat), but NO session profile.
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "worker-chat-8865656784")
+    monkeypatch.delenv("HERMES_SESSION_ORIGINATING_CHAT", raising=False)
+
+    out = kt._handle_create({
+        "title": "heisenberg worker create, no HERMES_PROFILE env",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1, subs
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "worker-chat-8865656784", subs
+    # The crux: profile resolved from HERMES_HOME, not left NULL.
+    assert subs[0]["notifier_profile"] == "heisenberg", subs
+
+
+def test_resolve_process_profile_prefers_env_then_hermes_home(monkeypatch, tmp_path):
+    """Unit check of the profile resolver used by _maybe_auto_subscribe.
+
+    Priority: HERMES_PROFILE_NAME -> HERMES_PROFILE -> HERMES_HOME-derived
+    profile. get_active_profile_name() always yields a routable profile name
+    (e.g. "default" for the base install, the named profile when HERMES_HOME
+    is a profile dir) — it never returns None for a configured HERMES_HOME, so
+    the resolver returns a routable value, not None.
+    """
+    from tools import kanban_tools as kt
+
+    # HERMES_HOME shaped as a profile dir (<root>/profiles/<name>) resolves to
+    # the profile name regardless of whether it lives under ~/.hermes.
+    hermes_home = tmp_path / "root" / "profiles" / "heisenberg"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    assert kt._resolve_process_profile() == "heisenberg"
+
+    # HERMES_PROFILE wins over HERMES_HOME.
+    monkeypatch.setenv("HERMES_PROFILE", "walter")
+    assert kt._resolve_process_profile() == "walter"
+
+    # HERMES_PROFILE_NAME takes precedence over HERMES_PROFILE.
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "skyler")
+    assert kt._resolve_process_profile() == "skyler"
+
+    # With no env profile, derive from HERMES_HOME again.
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    assert kt._resolve_process_profile() == "heisenberg"

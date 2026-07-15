@@ -970,6 +970,45 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _resolve_process_profile() -> Optional[str]:
+    """Best-effort profile name for the *current process*.
+
+    The notifier needs to know which profile's bot adapter must deliver a
+    notification. Inside a gateway worker the profile is known from
+    ``HERMES_HOME`` (the launcher exports it from ``--profile <name>``), but
+    the legacy ``HERMES_PROFILE`` / ``HERMES_SESSION_PROFILE`` env vars are
+    NOT exported by the gateway on every code path (verified: all 14+ gateway
+    PIDs have ``HERMES_HOME`` set to ``~/.hermes/profiles/<name>`` while
+    ``HERMES_PROFILE`` is unset). We therefore resolve the profile from
+    ``HERMES_HOME`` via :func:`hermes_cli.profiles.get_active_profile_name`
+    before giving up.
+
+    Resolution order:
+      1. ``HERMES_PROFILE_NAME`` env (used by some CLI paths, e.g. kanban.py).
+      2. ``HERMES_PROFILE`` env (legacy).
+      3. ``get_active_profile_name()`` — derives the profile from HERMES_HOME.
+      4. ``None`` (genuine no-profile context: CLI/cron/test, or an
+         unrecognized HERMES_HOME).
+
+    Returns ``None`` (never ``"custom"``/empty) when no real profile can be
+    inferred, so callers can keep emitting a blank ``notifier_profile`` only
+    for the legitimately-no-channel paths (TUI/CLI no-op).
+    """
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        v = os.environ.get(env)
+        if v:
+            return v
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        name = get_active_profile_name()
+        if name and name != "custom":
+            return name
+    except Exception as _exc:
+        logger.debug("_resolve_process_profile: profile resolution failed: %r", _exc)
+    return None
+
+
 def _resolve_originating_chat(task_id: str) -> Optional[dict]:
     """Best-effort resolution of the USER chat that should be notified.
 
@@ -1010,7 +1049,7 @@ def _resolve_originating_chat(task_id: str) -> Optional[dict]:
         # process env as a last resort so we never emit a blank profile.
         _orig_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
+            or _resolve_process_profile()
             or ""
         )
         if _orig and _orig_platform:
@@ -1158,7 +1197,7 @@ def _maybe_auto_subscribe(
         chat_id = str(notify_chat_id)
         thread_id = notify_thread_id or None
         user_id = None
-        notifier_profile = os.environ.get("HERMES_PROFILE") or None
+        notifier_profile = _resolve_process_profile()
     else:
         # Try the gateway-stamped originating chat first (authoritative
         # "who asked" pointer, set on every inbound gateway message).
@@ -1169,7 +1208,7 @@ def _maybe_auto_subscribe(
             thread_id = _originating.get("thread_id") or None
             user_id = _originating.get("user_id") or None
             notifier_profile = _originating.get("notifier_profile") or (
-                os.environ.get("HERMES_PROFILE") or None
+                _resolve_process_profile()
             )
         else:
             try:
@@ -1202,7 +1241,7 @@ def _maybe_auto_subscribe(
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
                 notifier_profile = (
                     get_session_env("HERMES_SESSION_PROFILE", "")
-                    or os.environ.get("HERMES_PROFILE")
+                    or _resolve_process_profile()
                 )
             except Exception as _exc:
                 logger.warning(
@@ -1218,7 +1257,7 @@ def _maybe_auto_subscribe(
     # row is always routable. Only a TUI/CLI no-op (empty chat_id) legitimately
     # has no profile.
     if chat_id and platform and not notifier_profile:
-        notifier_profile = os.environ.get("HERMES_PROFILE") or None
+        notifier_profile = _resolve_process_profile()
 
     # Lazy-import to keep the module-level dependency light
     try:
