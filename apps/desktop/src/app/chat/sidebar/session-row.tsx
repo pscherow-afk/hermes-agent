@@ -13,6 +13,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
+import { $backgroundRunningSessionIds } from '@/store/composer-status'
 import { $attentionSessionIds, $unreadFinishedSessionIds } from '@/store/session'
 import { openSessionTile } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
@@ -80,6 +81,8 @@ export function SidebarSessionRow({
   // True when the session's most recent turn finished in the background (while
   // the user was viewing a different session) and hasn't been opened since.
   const isUnread = useStore($unreadFinishedSessionIds).includes(session.id)
+  // True when a terminal(background=true) process is alive in this session.
+  const hasBackground = useStore($backgroundRunningSessionIds).includes(session.id)
 
   return (
     <SessionContextMenu
@@ -210,14 +213,15 @@ export function SidebarSessionRow({
               <SessionRowLeadDot
                 branchStem={branchStem}
                 className="transition-opacity group-hover/handle:opacity-0 group-focus-within/handle:opacity-0"
+                hasBackground={hasBackground}
+                isUnread={isUnread}
                 isWorking={isWorking}
                 needsInput={needsInput}
-                isUnread={isUnread}
               />
             </SidebarRowGrab>
           ) : (
             <SidebarRowLead className={needsInput ? 'overflow-visible' : 'overflow-hidden'}>
-              <SessionRowLeadDot branchStem={branchStem} isWorking={isWorking} needsInput={needsInput} isUnread={isUnread} />
+              <SessionRowLeadDot branchStem={branchStem} hasBackground={hasBackground} isUnread={isUnread} isWorking={isWorking} needsInput={needsInput} />
             </SidebarRowLead>
           )}
           {handoffSource && handoffLabel ? (
@@ -241,12 +245,14 @@ export function SidebarSessionRow({
 function SessionRowLeadDot({
   branchStem,
   isWorking,
+  hasBackground = false,
   needsInput = false,
   isUnread = false,
   className
 }: {
   branchStem?: string
   isWorking: boolean
+  hasBackground?: boolean
   needsInput?: boolean
   isUnread?: boolean
   className?: string
@@ -258,18 +264,32 @@ function SessionRowLeadDot({
           {branchStem}
         </span>
       ) : null}
-      <SidebarRowDot isWorking={isWorking} needsInput={needsInput} isUnread={isUnread} />
+      <SidebarRowDot hasBackground={hasBackground} isUnread={isUnread} isWorking={isWorking} needsInput={needsInput} />
     </span>
   )
 }
 
+// Priority-ordered dot states. Each entry maps a session lifecycle phase to a
+// distinct visual so the user can tell at a glance what's happening without
+// reading text. The first active entry wins; if none are active, the idle dot
+// (small steady gray) is rendered as a fallback.
+interface DotState {
+  active: boolean
+  ariaLabel?: string
+  className: string
+  role?: 'status'
+  title?: string
+}
+
 function SidebarRowDot({
   isWorking,
+  hasBackground = false,
   needsInput = false,
   isUnread = false,
   className
 }: {
   isWorking: boolean
+  hasBackground?: boolean
   needsInput?: boolean
   isUnread?: boolean
   className?: string
@@ -277,47 +297,61 @@ function SidebarRowDot({
   const { t } = useI18n()
   const r = t.sidebar.row
 
-  // "Needs input" wins over "working": a clarify-blocked session is technically
-  // still running, but the actionable state is that it's waiting on the user.
-  // Amber + steady (no ping) reads as "your turn", distinct from the accent
-  // pulse of an active turn.
-  if (needsInput) {
-    return (
-      <span
-        aria-label={r.needsInput}
-        className={cn('quest-glow relative size-1.5 rounded-full bg-amber-500', className)}
-        role="status"
-        title={r.waitingForAnswer}
-      />
-    )
-  }
+  const states: DotState[] = [
+    // "Needs input": amber steady — a clarify/approval is blocking the turn.
+    // Steady (not pulsing) reads as "your turn", distinct from the accent
+    // pulse of an active turn.
+    {
+      active: needsInput,
+      ariaLabel: r.needsInput,
+      className: 'quest-glow relative size-1.5 rounded-full bg-amber-500',
+      role: 'status',
+      title: r.waitingForAnswer
+    },
+    // "Working": accent pulse — the LLM turn is actively running.
+    {
+      active: isWorking,
+      ariaLabel: r.sessionRunning,
+      className:
+        "relative size-1.5 rounded-full bg-(--ui-accent) shadow-[0_0_0.625rem_color-mix(in_srgb,var(--ui-accent)_55%,transparent)] before:absolute before:inset-0 before:animate-ping before:rounded-full before:bg-(--ui-accent) before:opacity-70 before:content-['']",
+      role: 'status'
+    },
+    // "Background task running": pulsing gray — a terminal(background=true)
+    // process is alive while the LLM is idle. Gray (not accent) reads as
+    // "something chugging along", distinct from the live pulse of a turn.
+    {
+      active: hasBackground,
+      ariaLabel: r.backgroundRunning,
+      className:
+        "relative size-1.5 rounded-full bg-muted-foreground/50 before:absolute before:inset-0 before:animate-ping before:rounded-full before:bg-muted-foreground/50 before:opacity-50 before:content-['']",
+      role: 'status',
+      title: r.backgroundRunning
+    },
+    // "Unread finished": steady green — a background session's turn completed
+    // and the user hasn't opened it since. "Something new here, go look."
+    {
+      active: isUnread,
+      ariaLabel: r.finishedUnread,
+      className: 'size-1.5 rounded-full bg-emerald-500',
+      role: 'status',
+      title: r.finishedUnread
+    }
+  ]
 
-  // "Unread finished" wins over the default gray dot: a background session's
-  // turn completed and the user hasn't opened it since. Steady green (no pulse)
-  // reads as "something new here, go look" — distinct from the live accent
-  // pulse of a running turn.
-  if (isUnread) {
+  const active = states.find(s => s.active)
+
+  if (!active) {
     return (
-      <span
-        aria-label={r.finishedUnread}
-        className={cn('size-1.5 rounded-full bg-emerald-500', className)}
-        role="status"
-        title={r.finishedUnread}
-      />
+      <span className={cn('size-1 rounded-full bg-(--ui-text-quaternary) opacity-80', className)} />
     )
   }
 
   return (
     <span
-      aria-label={isWorking ? r.sessionRunning : undefined}
-      className={cn(
-        'rounded-full',
-        isWorking
-          ? "relative size-1.5 bg-(--ui-accent) shadow-[0_0_0.625rem_color-mix(in_srgb,var(--ui-accent)_55%,transparent)] before:absolute before:inset-0 before:animate-ping before:rounded-full before:bg-(--ui-accent) before:opacity-70 before:content-['']"
-          : 'size-1 bg-(--ui-text-quaternary) opacity-80',
-        className
-      )}
-      role={isWorking ? 'status' : undefined}
+      aria-label={active.ariaLabel}
+      className={cn(active.className, className)}
+      role={active.role}
+      title={active.title}
     />
   )
 }
