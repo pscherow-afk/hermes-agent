@@ -861,6 +861,14 @@ def _handle_create(args: dict, **kw) -> str:
     # CLI / dashboard paths and on legacy hosts that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
     priority = args.get("priority")
+    # Explicit notification target (Variant A). An orchestrator that creates a
+    # task on behalf of a user passes the user's originating chat explicitly,
+    # because the live session ContextVars may be cleared (finally-handler) or
+    # may carry the orchestrator's own session identity by the time
+    # kanban_create runs. When provided, these WIN over the ContextVars.
+    notify_chat_id = args.get("notify_chat_id") or None
+    notify_platform = args.get("notify_platform") or None
+    notify_thread_id = args.get("notify_thread_id") or None
     # Resolve workspace. If the caller passed one explicitly, honor it.
     # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)
     # inherits its own running task's workspace, so a worker editing a
@@ -942,7 +950,12 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(
+                conn, new_tid,
+                notify_chat_id=notify_chat_id,
+                notify_platform=notify_platform,
+                notify_thread_id=notify_thread_id,
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -957,8 +970,114 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
-    """Auto-subscribe the calling session to task completion / block events.
+def _resolve_originating_chat(task_id: str) -> Optional[dict]:
+    """Best-effort resolution of the USER chat that should be notified.
+
+    Priority:
+      1. ``HERMES_SESSION_ORIGINATING_CHAT`` ContextVar — the gateway stamps
+         this on every inbound message to the *user's* chat_id, immune to the
+         cross-session ContextVar leak that corrupts ``HERMES_SESSION_CHAT_ID``
+         inside a worker spawned from a concurrent sibling message. We pair the
+         chat_id with the live session's platform/profile so the notifier can
+         route the message. Returns ``None`` when unset (e.g. CLI/cron/non-gateway).
+      2. Parent-task inheritance — when ``task_id`` is a child of another task
+         (orchestrator fan-out), copy the parent's existing notify subscription
+         so the user still hears back even if the worker's session context was
+         cleared. This is the safety net for the bug where Heisenberg calls
+         kanban_create without passing notify_* and the orchestrator's own
+         session context no longer carries the user's chat.
+
+    Returns a dict ``{platform, chat_id, thread_id, user_id, notifier_profile}``
+    or ``None`` when no originating chat can be resolved (no-op path).
+
+    ``notifier_profile`` is critical: it tells the watcher which profile's bot
+    adapter must deliver the notification. We never leave it blank when we have
+    a chat, because a blank ``notifier_profile`` makes the watcher SKIP the row
+    (it can't decide which bot to use) — that silent-skip is exactly the
+    cross-profile mis-delivery this change exists to prevent. When the live
+    session context doesn't carry a profile we fall back to ``HERMES_PROFILE``,
+    and in the parent-inheritance path we copy the parent's ``notifier_profile``
+    verbatim (it already owns that chat).
+    """
+    try:
+        from gateway.session_context import get_session_env
+        _orig = get_session_env("HERMES_SESSION_ORIGINATING_CHAT", "")
+        _orig_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        _orig_thread = get_session_env("HERMES_SESSION_THREAD_ID", "")
+        _orig_user = get_session_env("HERMES_SESSION_USER_ID", "")
+        # The *profile that owns the originating chat* is the notifier. In the
+        # gateway it's stamped via HERMES_SESSION_PROFILE; fall back to the
+        # process env as a last resort so we never emit a blank profile.
+        _orig_profile = (
+            get_session_env("HERMES_SESSION_PROFILE", "")
+            or os.environ.get("HERMES_PROFILE")
+            or ""
+        )
+        if _orig and _orig_platform:
+            return {
+                "platform": _orig_platform,
+                "chat_id": str(_orig),
+                "thread_id": _orig_thread or None,
+                "user_id": _orig_user or None,
+                "notifier_profile": _orig_profile or None,
+            }
+    except Exception as _exc:
+        logger.debug("_resolve_originating_chat: contextvar probe failed: %r", _exc)
+
+    # Parent-task inheritance via task_links (the real schema — parents are
+    # stored in task_links, NOT on the tasks row). Walk up a few levels: a
+    # fan-out child may be nested under an orchestrator task that itself
+    # inherited the user's subscription. Copy the first parent's notify sub
+    # verbatim, including its notifier_profile.
+    try:
+        try:
+            kb, conn = _connect()
+        except Exception:
+            return None
+        try:
+            seen: set = set()
+            frontier = [task_id]
+            for _depth in range(4):  # bounded BFS so a cycle can't loop forever
+                if not frontier:
+                    break
+                nxt = []
+                for _tid in frontier:
+                    seen.add(_tid)
+                    rows = conn.execute(
+                        "SELECT parent_id FROM task_links WHERE child_id = ?",
+                        (_tid,),
+                    ).fetchall()
+                    for r in rows:
+                        pid = r["parent_id"]
+                        subs = kb.list_notify_subs(conn, pid)
+                        if subs:
+                            sub = subs[0]
+                            if sub.get("chat_id") and sub.get("platform"):
+                                return {
+                                    "platform": sub.get("platform"),
+                                    "chat_id": sub.get("chat_id"),
+                                    "thread_id": sub.get("thread_id") or None,
+                                    "user_id": sub.get("user_id") or None,
+                                    "notifier_profile": sub.get("notifier_profile")
+                                    or None,
+                                }
+                        if pid not in seen:
+                            nxt.append(pid)
+                frontier = nxt
+        finally:
+            conn.close()
+    except Exception as _exc:
+        logger.debug("_resolve_originating_chat: parent lookup failed: %r", _exc)
+    return None
+
+
+def _maybe_auto_subscribe(
+    conn: Any, task_id: str,
+    notify_chat_id: Optional[str] = None,
+    notify_platform: Optional[str] = None,
+    notify_thread_id: Optional[str] = None,
+) -> bool:
+    """Auto-subscribe a notification target to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
     session context, config gate disabled, or best-effort failure). The
@@ -971,7 +1090,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     originating user/chat opted out via the per-platform notification
     toggle (see ``hermes dashboard``).
 
-    Subscription paths:
+    Subscription paths, in priority order:
+
+    - **Explicit (Variant A)**: when ``notify_chat_id`` is passed (and
+      ``notify_platform`` present), it is used verbatim — this is the
+      originating USER's chat, supplied by an orchestrator that fans out
+      on the user's behalf. It wins over the live ContextVars because by
+      the time the orchestrator calls kanban_create, the session
+      ContextVars may be cleared (finally-handler) or may carry the
+      orchestrator's own session identity rather than the user's.
 
     - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
       and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
@@ -1004,42 +1131,97 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # user-friendly behaviour that mirrors the pre-gate implementation.
         pass
 
+    # Resolve the notification target. Priority order:
+    #   1. Explicit notify_* args (Variant A) — supplied by an orchestrator
+    #      that fans out on the user's behalf. Wins over everything.
+    #   2. HERMES_SESSION_ORIGINATING_CHAT (gateway-stamped "who asked") —
+    #      the authoritative user chat, immune to the cross-session
+    #      ContextVar leak that makes HERMES_SESSION_CHAT_ID unreliable
+    #      inside a worker spawned from a concurrent sibling message. This
+    #      is the fix for the bug where an orchestrator (Heisenberg) calls
+    #      kanban_create without passing notify_* and the subscription fell
+    #      through to the wrong (foreign) bot.
+    #   3. Live session ContextVars (HERMES_SESSION_PLATFORM/CHAT_ID) —
+    #      same-context gateway path (direct worker, not a fan-out).
+    #   4. Parent-task inheritance — when this create is itself a child of
+    #      another task (orchestrator fan-out), copy the parent's existing
+    #      notify subscription so the user still hears back.
+    #   5. TUI key fallback, then nothing (no-op).
+    # The originating chat carries only chat_id; we pair it with the live
+    # session's platform/profile so the notifier can route the message.
     platform = ""
     chat_id = ""
-    try:
-        from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if not platform or not chat_id:
-            # TUI / desktop fallback: platform/chat_id ContextVars are
-            # cleared for TUI sessions, but the parent process exports
-            # HERMES_SESSION_KEY into the subprocess env. Treat that
-            # as a "tui" subscription so the TUI notification poller
-            # (tui_gateway/server.py) can pick it up.
-            #
-            # HERMES_SESSION_ID is intentionally NOT a fallback here:
-            # it is set by ACP / the agent subprocess for telemetry
-            # regardless of whether the parent is a TUI or a CLI, so
-            # treating it as a notification target would auto-subscribe
-            # every CLI invocation, which is exactly the over-eager
-            # behaviour that got #19718 reverted upstream. The TUI
-            # poller keys on HERMES_SESSION_KEY.
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
+    if notify_chat_id and notify_platform:
+        # Explicit user-originating target supplied by the caller — this
+        # is exactly the chat we must notify, regardless of who is running.
+        platform = str(notify_platform)
+        chat_id = str(notify_chat_id)
+        thread_id = notify_thread_id or None
+        user_id = None
+        notifier_profile = os.environ.get("HERMES_PROFILE") or None
+    else:
+        # Try the gateway-stamped originating chat first (authoritative
+        # "who asked" pointer, set on every inbound gateway message).
+        _originating = _resolve_originating_chat(task_id)
+        if _originating:
+            platform = _originating["platform"]
+            chat_id = _originating["chat_id"]
+            thread_id = _originating.get("thread_id") or None
+            user_id = _originating.get("user_id") or None
+            notifier_profile = _originating.get("notifier_profile") or (
+                os.environ.get("HERMES_PROFILE") or None
             )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
+        else:
+            try:
+                from gateway.session_context import get_session_env
+                platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+                chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+                if not platform or not chat_id:
+                    # TUI / desktop fallback: platform/chat_id ContextVars are
+                    # cleared for TUI sessions, but the parent process exports
+                    # HERMES_SESSION_KEY into the subprocess env. Treat that
+                    # as a "tui" subscription so the TUI notification poller
+                    # (tui_gateway/server.py) can pick it up.
+                    #
+                    # HERMES_SESSION_ID is intentionally NOT a fallback here:
+                    # it is set by ACP / the agent subprocess for telemetry
+                    # regardless of whether the parent is a TUI or a CLI, so
+                    # treating it as a notification target would auto-subscribe
+                    # every CLI invocation, which is exactly the over-eager
+                    # behaviour that got #19718 reverted upstream. The TUI
+                    # poller keys on HERMES_SESSION_KEY.
+                    session_key = (
+                        get_session_env("HERMES_SESSION_KEY", "")
+                        or os.environ.get("HERMES_SESSION_KEY", "")
+                    )
+                    if not session_key:
+                        return False  # CLI / cron / test — no persistent channel
+                    platform = "tui"
+                    chat_id = session_key
+                thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+                user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+                notifier_profile = (
+                    get_session_env("HERMES_SESSION_PROFILE", "")
+                    or os.environ.get("HERMES_PROFILE")
+                )
+            except Exception as _exc:
+                logger.warning(
+                    "_maybe_auto_subscribe failed resolving context: %r", _exc
+                )
+                return False
 
-        # Lazy-import to keep the module-level dependency light
+    # Safety: a resolved (platform, chat_id) MUST carry a notifier_profile,
+    # otherwise the watcher cannot choose which profile's bot adapter delivers
+    # the notification and silently SKIPS the row — that is the exact
+    # cross-profile mis-delivery bug (foreign bot or no delivery at all). When
+    # the context didn't supply a profile, fall back to HERMES_PROFILE so the
+    # row is always routable. Only a TUI/CLI no-op (empty chat_id) legitimately
+    # has no profile.
+    if chat_id and platform and not notifier_profile:
+        notifier_profile = os.environ.get("HERMES_PROFILE") or None
+
+    # Lazy-import to keep the module-level dependency light
+    try:
         from hermes_cli import kanban_db as _kb
         _kb.add_notify_sub(
             conn, task_id=task_id,
@@ -1551,6 +1733,35 @@ KANBAN_CREATE_SCHEMA = {
                 ),
             },
             "board": _board_schema_prop(),
+            "notify_chat_id": {
+                "type": "string",
+                "description": (
+                    "Explicit notification target chat id. When an "
+                    "orchestrator creates a task on behalf of a user, pass "
+                    "the USER's originating chat id here. It wins over the "
+                    "live session ContextVars (which may be cleared or carry "
+                    "the orchestrator's own identity by the time "
+                    "kanban_create runs), so terminal-state notifications "
+                    "(completed/blocked/gave_up) reach the user, not the "
+                    "orchestrator's chat. Requires notify_platform to take "
+                    "effect."
+                ),
+            },
+            "notify_platform": {
+                "type": "string",
+                "description": (
+                    "Notification platform for notify_chat_id (e.g. "
+                    "'telegram', 'discord', 'slack'). Required alongside "
+                    "notify_chat_id."
+                ),
+            },
+            "notify_thread_id": {
+                "type": "string",
+                "description": (
+                    "Optional thread id for the notify_chat_id target, so "
+                    "the completion message lands in the right thread."
+                ),
+            },
         },
         "required": ["title", "assignee"],
     },

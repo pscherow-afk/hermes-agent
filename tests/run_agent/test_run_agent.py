@@ -4747,7 +4747,7 @@ class TestRunConversation:
         """Partial streamed content takes priority over _last_content_with_tools fallback."""
         self._setup_agent(agent)
         # Set up the prior-turn fallback content (from a previous turn with tool calls)
-        agent._last_content_with_tools = "Old content from prior turn with tools"
+        agent._retry_counters.last_content_with_tools = "Old content from prior turn with tools"
         # Stub response with no content
         empty_stub = _mock_response(content=None, finish_reason="stop")
 

@@ -15235,6 +15235,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            # Stamp the originating USER chat so tools that fan out on the
+            # user's behalf (e.g. an orchestrator worker calling
+            # kanban_create) can notify the human — not the orchestrator's
+            # own session. This is the authoritative "who asked" pointer;
+            # see gateway/session_context.HERMES_SESSION_ORIGINATING_CHAT.
+            originating_chat=context.source.chat_id,
             async_delivery=_async_delivery,
         )
 

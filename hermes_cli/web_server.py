@@ -11916,6 +11916,152 @@ async def get_memory_status():
     }
 
 
+def _force_redact(text: str) -> str:
+    """Redact secrets from a memory fact, force-on regardless of global toggle.
+
+    Uses the shared Tirith-grade redactor (``agent.redact.redact_sensitive_text``)
+    with ``force=True, file_read=True`` so secret-shaped content is never
+    exposed through the Memory API even if the operator disabled redaction
+    globally. Falls back to the lighter ``redact_key`` heuristic on import error.
+    """
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text, force=True, file_read=True)
+    except Exception:
+        return redact_key(text) if text else text
+
+
+@app.get("/api/memory/search")
+async def search_memory_facts(q: str = "", limit: int = 20, offset: int = 0, scope: str = "all", request: Request = None):
+    """Read-only search across the active profile's memory files (facts only).
+
+    Returns redacted matches from MEMORY.md / USER.md. No secrets exposed.
+    Token-authable (registered via ``register_memory_api``); rate-limited and
+    audit-logged. ``scope`` filters to ``memory`` / ``user`` / ``all``.
+    """
+    from hermes_cli.memory_api import (
+        audit_event,
+        client_ip_from,
+        principal_from,
+        rate_limit_allowed,
+    )
+    from hermes_cli.dashboard_auth.audit import AuditEvent
+
+    if request is None:
+        # FastAPI always injects Request; this branch is purely defensive.
+        return {"results": [], "count": 0, "total": 0, "limit": limit, "offset": offset}
+    if not rate_limit_allowed(client_ip_from(request)):
+        audit_event(
+            AuditEvent.TOKEN_AUTH_FAILURE,
+            ip=client_ip_from(request), principal=principal_from(request),
+            reason="rate_limited",
+        )
+        from fastapi.responses import JSONResponse as _JR
+
+        return _JR(status_code=429, content={"error": "rate_limited", "detail": "Too many requests"})
+
+    if scope not in ("all", "memory", "user"):
+        from fastapi.responses import JSONResponse as _JR
+
+        return _JR(status_code=400, content={"error": "bad_request", "detail": "scope must be one of: all, memory, user"})
+
+    _mem_dir = get_hermes_home() / "memories"
+    _results = []
+    _query = (q or "").strip().lower()
+    _sources = []
+    if scope in ("all", "memory"):
+        _sources.append("MEMORY.md")
+    if scope in ("all", "user"):
+        _sources.append("USER.md")
+    for _fname in _sources:
+        _path = _mem_dir / _fname
+        if not _path.exists():
+            continue
+        try:
+            _text = _path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for _line in _text.splitlines():
+            if not _line.strip():
+                continue
+            # Force-redact any secret-shaped content before matching/exposing.
+            _redacted = _force_redact(_line)
+            if not _query or _query in _line.lower():
+                _results.append({"file": _fname, "text": _redacted[:500]})
+
+    # Pagination
+    try:
+        _limit = max(1, min(int(limit), 200))
+        _offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        from fastapi.responses import JSONResponse as _JR
+
+        return _JR(status_code=400, content={"error": "bad_request", "detail": "limit/offset must be integers"})
+    _page = _results[_offset : _offset + _limit]
+    audit_event(
+        AuditEvent.TOKEN_AUTH_SUCCESS,
+        ip=client_ip_from(request), principal=principal_from(request),
+        query=(q or "")[:128], scope=scope, total=len(_results), returned=len(_page),
+    )
+    return {"results": _page, "count": len(_results), "total": len(_results),
+            "limit": _limit, "offset": _offset}
+
+
+@app.get("/api/memory/profile/{name}")
+async def get_memory_profile(name: str, request: Request = None):
+    """Read-only dump of a profile's memory files (redacted).
+
+    Token-authable (registered via ``register_memory_api``); rate-limited and
+    audit-logged. Returns 404 when the profile directory is unknown.
+    """
+    from hermes_cli.memory_api import (
+        audit_event,
+        client_ip_from,
+        principal_from,
+        rate_limit_allowed,
+    )
+    from hermes_cli.dashboard_auth.audit import AuditEvent
+
+    if request is None:
+        return {"profile": name, "files": {}}
+    if not rate_limit_allowed(client_ip_from(request)):
+        audit_event(
+            AuditEvent.TOKEN_AUTH_FAILURE,
+            ip=client_ip_from(request), principal=principal_from(request),
+            reason="rate_limited", profile=name,
+        )
+        from fastapi.responses import JSONResponse as _JR
+
+        return _JR(status_code=429, content={"error": "rate_limited", "detail": "Too many requests"})
+
+    _profile_home = get_hermes_home() / "profiles" / name / "memories"
+    if not _profile_home.exists():
+        audit_event(
+            AuditEvent.TOKEN_AUTH_FAILURE,
+            ip=client_ip_from(request), principal=principal_from(request),
+            reason="unknown_profile", profile=name,
+        )
+        from fastapi.responses import JSONResponse as _JR
+
+        return _JR(status_code=404, content={"error": f"profile '{name}' not found"})
+    _out = {}
+    for _fname in ("MEMORY.md", "USER.md"):
+        _path = _profile_home / _fname
+        if _path.exists():
+            try:
+                _lines = _path.read_text(encoding="utf-8").splitlines()
+                _redacted = [_force_redact(l) for l in _lines]
+                _out[_fname] = "\n".join(_redacted)
+            except Exception:
+                _out[_fname] = None
+    audit_event(
+        AuditEvent.TOKEN_AUTH_SUCCESS,
+        ip=client_ip_from(request), principal=principal_from(request), profile=name,
+    )
+    return {"profile": name, "files": _out}
+
+
 @app.put("/api/memory/provider")
 async def set_memory_provider(body: MemoryProviderSelect):
     provider = _normalize_memory_provider_name(body.provider)
@@ -17195,6 +17341,55 @@ _mount_plugin_api_routes()
 # not whether the routes exist.
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 app.include_router(_dashboard_auth_router)
+
+# ---------------------------------------------------------------------------
+# Read-only Memory API (Task P2b). Mounts /api/memory/* with token auth,
+# rate limiting, audit logging, and redaction. Fail-closed: if no credential
+# is configured the routes still mount but reject all callers with 401.
+# ---------------------------------------------------------------------------
+try:
+    from hermes_cli.memory_api import register_memory_api
+
+    register_memory_api(app)
+except Exception as _mem_api_exc:  # noqa: BLE001 — never let a failed mount break the server
+    _log.warning("memory-api: failed to register: %s", _mem_api_exc)
+
+# ---------------------------------------------------------------------------
+# Health-check endpoint (Top-P0 from Harness Audit — Observability layer).
+# Returns 200 + {"status": "ok"} when the process and state.db are healthy,
+# 503 + {"status": "error", "db": "error"} when the SQLite store is corrupt
+# or unreachable.  Used by the dashboards and external monitors.
+# ---------------------------------------------------------------------------
+import sqlite3 as _sqlite3  # noqa: E402
+
+from hermes_cli.config import cfg_get as _cfg_get  # noqa: E402
+
+
+@app.get("/health", tags=["system"])
+async def _health_check():
+    """Liveness/readiness probe for gateway + dashboard."""
+    try:
+        _state_path = _cfg_get("state_db_path") or os.path.expanduser(
+            "~/.hermes/state.db"
+        )
+        _conn = _sqlite3.connect(f"file:{_state_path}?mode=ro", uri=True)
+        try:
+            _cur = _conn.execute("PRAGMA integrity_check")
+            _row = _cur.fetchone()
+            _db_ok = bool(_row) and _row[0] == "ok"
+        finally:
+            _conn.close()
+    except Exception:
+        _db_ok = False
+    if not _db_ok:
+        from fastapi.responses import JSONResponse as _JSONResponse  # noqa: E402
+
+        return _JSONResponse(
+            status_code=503,
+            content={"status": "error", "db": "error"},
+        )
+    return {"status": "ok", "db": "ok"}
+
 
 mount_spa(app)
 

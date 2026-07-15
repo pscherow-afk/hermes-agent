@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import copy
 import re
 import threading
 import time
@@ -1752,7 +1753,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
         for msg in messages:
-            api_msg = msg.copy()
+            # Deep copy — NOT msg.copy() (shallow).  Mirrors the main loop's
+            # P0-9 fix: the summary path mutates nested structures (tool_calls,
+            # content blocks, reasoning_content) in-place via
+            # _sanitize_api_messages / _drop_thinking_only_and_merge_users /
+            # surrogate sanitization.  A shallow copy would leak those mutations
+            # into the persisted `messages` history.
+            api_msg = copy.deepcopy(msg)
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                 api_msg.pop(internal_field, None)
