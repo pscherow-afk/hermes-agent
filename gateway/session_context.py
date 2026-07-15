@@ -90,6 +90,19 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+# Originating user chat. A messaging-gateway inbound handler stamps this to
+# the *user's* chat identity (the human that sent the message) BEFORE it
+# dispatches any sub-work. Tools that create follow-up artifacts on the user's
+# behalf (e.g. kanban_create called by an orchestrator worker) read it to
+# notify the *user*, not the orchestrator's own session. It is intentionally a
+# single authoritative "who asked" pointer, immune to the cross-session
+# ContextVar inheritance that makes HERMES_SESSION_CHAT_ID unreliable inside a
+# worker spawned from a concurrent sibling message. When unset, callers fall
+# back to HERMES_SESSION_CHAT_ID (same-context gateway path) or to
+# parent-task inheritance (worker path, see tools/kanban_tools.py).
+_SESSION_ORIGINATING_CHAT: ContextVar = ContextVar(
+    "HERMES_SESSION_ORIGINATING_CHAT", default=_UNSET
+)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -133,6 +146,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_SESSION_ORIGINATING_CHAT": _SESSION_ORIGINATING_CHAT,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -166,6 +180,7 @@ def set_session_vars(
     session_id: str = "",
     message_id: str = "",
     profile: str = "",
+    originating_chat: str = "",
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
@@ -203,6 +218,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _SESSION_ORIGINATING_CHAT.set(originating_chat),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -238,6 +254,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_ORIGINATING_CHAT,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
