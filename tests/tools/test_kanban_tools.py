@@ -2223,6 +2223,81 @@ def test_create_partial_session_context_no_subscribe(monkeypatch, worker_env):
     assert d["subscribed"] is False, d
 
 
+def test_create_explicit_notify_target_wins_over_empty_context(monkeypatch, worker_env):
+    """Variant A: orchestrator passes the USER's chat explicitly while the
+    live session ContextVars are empty (cleared finally-handler / no
+    gateway binding). The subscription MUST go to notify_chat_id, not be
+    skipped. This is the exact bug from t_3651470a."""
+    from tools import kanban_tools as kt
+    # Simulate an orchestrator context with no usable session vars.
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    out = kt._handle_create({
+        "title": "explicit notify target",
+        "assignee": "peer",
+        "notify_chat_id": "user-chat-99",
+        "notify_platform": "telegram",
+        "notify_thread_id": "user-thread-1",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "user-chat-99"
+    assert subs[0]["thread_id"] == "user-thread-1"
+
+
+def test_create_explicit_notify_target_wins_over_orchestrator_context(monkeypatch, worker_env):
+    """Variant A: even if the orchestrator's OWN session ContextVars are set
+    (e.g. it ran under a gateway), the explicit notify_* for the end user
+    must win — notifications go to the user, not the orchestrator's chat."""
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "orchestrator-chat")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "orchestrator-thread")
+
+    out = kt._handle_create({
+        "title": "explicit beats orchestrator context",
+        "assignee": "peer",
+        "notify_chat_id": "user-chat-7",
+        "notify_platform": "telegram",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "user-chat-7"
+
+
+def test_create_notify_chat_id_without_platform_is_ignored(monkeypatch, worker_env):
+    """notify_chat_id alone (no notify_platform) is ambiguous -> fall back to
+    ContextVars. With no ContextVars at all, that means no subscription."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    out = kt._handle_create({
+        "title": "notify chat without platform",
+        "assignee": "peer",
+        "notify_chat_id": "user-chat-99",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
     _maybe_auto_subscribe must NOT bubble that up and fail the parent
