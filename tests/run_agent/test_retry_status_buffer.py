@@ -9,6 +9,8 @@ silently dropped.
 from __future__ import annotations
 
 
+import types
+
 from run_agent import AIAgent
 
 
@@ -20,7 +22,7 @@ def _make_bare_agent():
     agent.log_prefix = ""
     agent.status_callback = None
     agent.suppress_status_output = False
-    agent._mute_post_response = False
+    agent._retry_counters = types.SimpleNamespace(mute_post_response=False)
     agent._executing_tools = False
     agent._print_fn = None
     return agent

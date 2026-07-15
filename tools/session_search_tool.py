@@ -496,6 +496,64 @@ def _title_match_result(
     return entry
 
 
+def _parse_temporal_filters(
+    since: Optional[str],
+    until: Optional[str],
+    last_n_days: Optional[int],
+) -> tuple:
+    """Parse temporal filter args into (since_ts, until_ts) Unix timestamps.
+
+    Accepts ISO dates (``2026-07-01``), relative keywords (``last_week``,
+    ``last_month``, ``yesterday``), or an integer day-window via *last_n_days*.
+    Returns (None, None) when no filter is active.
+    """
+    import datetime as _dt
+
+    _now = _dt.datetime.now()
+    _since: Optional[float] = None
+    _until: Optional[float] = None
+
+    _rel_map = {
+        "yesterday": 1,
+        "last_week": 7,
+        "last_month": 30,
+    }
+
+    if last_n_days is not None:
+        try:
+            _n = int(last_n_days)
+            if _n > 0:
+                _since = (_now - _dt.timedelta(days=_n)).timestamp()
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(since, str) and since.strip():
+        _s = since.strip().lower()
+        if _s in _rel_map:
+            _since = (_now - _dt.timedelta(days=_rel_map[_s])).timestamp()
+        else:
+            for _fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    _since = _dt.datetime.strptime(since.strip(), _fmt).timestamp()
+                    break
+                except ValueError:
+                    continue
+
+    if isinstance(until, str) and until.strip():
+        _u = until.strip().lower()
+        if _u in _rel_map:
+            _until = (_now - _dt.timedelta(days=_rel_map[_u] - 1)).timestamp()
+        else:
+            for _fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    _until = _dt.datetime.strptime(until.strip(), _fmt).timestamp()
+                    break
+                except ValueError:
+                    continue
+
+    return _since, _until
+
+
 def _discover(
     db,
     query: str,
@@ -503,6 +561,8 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    since_ts: Optional[float] = None,
+    until_ts: Optional[float] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
@@ -523,6 +583,29 @@ def _discover(
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
+
+    # Apply temporal filters (episodic queries) on session start time.
+    if (since_ts is not None or until_ts is not None) and raw_results:
+        import datetime as _dt
+
+        _filtered = []
+        for _r in raw_results:
+            _started = _r.get("session_started") or _r.get("when")
+            if not _started:
+                continue
+            try:
+                if isinstance(_started, (int, float)):
+                    _ts = float(_started)
+                else:
+                    _ts = _dt.datetime.fromisoformat(str(_started)).timestamp()
+            except (ValueError, TypeError):
+                continue
+            if since_ts is not None and _ts < since_ts:
+                continue
+            if until_ts is not None and _ts > until_ts:
+                continue
+            _filtered.append(_r)
+        raw_results = _filtered
 
     # Demote automation (cron) rows below interactive ones before dedup, so a
     # high-volume cron corpus can't starve the user's own sessions out of the
@@ -628,6 +711,10 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
+    # Temporal filters (episodic queries)
+    since: str = None,
+    until: str = None,
+    last_n_days: int = None,
     # Cross-profile (any shape)
     profile: str = None,
 ) -> str:
@@ -730,6 +817,9 @@ def session_search(
         if candidate in ("newest", "oldest"):
             sort_norm = candidate
 
+    # Parse temporal filters (episodic queries)
+    _since_ts, _until_ts = _parse_temporal_filters(since, until, last_n_days)
+
     return _discover(
         db=db,
         query=query.strip(),
@@ -737,6 +827,8 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        since_ts=_since_ts,
+        until_ts=_until_ts,
     )
 
 
@@ -889,6 +981,30 @@ SESSION_SEARCH_SCHEMA = {
                     "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
                     "pass the profile segment here with session_id as the id segment. "
                     "Omit to use the current profile."
+                ),
+            },
+            "since": {
+                "type": "string",
+                "description": (
+                    "Discovery shape only. Lower bound for session start time. Accepts "
+                    "ISO date (2026-07-01), relative keyword (yesterday, last_week, "
+                    "last_month), or pairs with `until`. Filters episodic queries "
+                    "('what did we discuss about WB last week')."
+                ),
+            },
+            "until": {
+                "type": "string",
+                "description": (
+                    "Discovery shape only. Upper bound for session start time. Same "
+                    "formats as `since`. Use alone to mean 'up to this date'."
+                ),
+            },
+            "last_n_days": {
+                "type": "integer",
+                "description": (
+                    "Discovery shape only. Convenience window — return only sessions "
+                    "from the last N days (e.g. last_n_days=7). Overrides `since` when "
+                    "both are set."
                 ),
             },
         },

@@ -32,6 +32,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
+from agent.turn_retry_counters import TurnRetryCounters
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -1173,6 +1174,7 @@ def init_agent(
     else:
         agent._fallback_chain = []
     agent._fallback_index = 0
+    agent._retry_counters = TurnRetryCounters()
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None

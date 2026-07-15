@@ -34,6 +34,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.turn_retry_counters import TurnRetryCounters
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Unified retry/fallback counters for this turn.
+    retry_counters: "TurnRetryCounters" = None  # type: ignore[assignment]
 
 
 def build_turn_context(
@@ -219,18 +222,9 @@ def build_turn_context(
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
 
-    # Reset retry counters and iteration budget at the start of each turn.
-    agent._invalid_tool_retries = 0
-    agent._invalid_json_retries = 0
-    agent._empty_content_retries = 0
-    agent._incomplete_scratchpad_retries = 0
-    agent._codex_incomplete_retries = 0
-    agent._thinking_prefill_retries = 0
-    agent._post_tool_empty_retried = False
-    agent._last_content_with_tools = None
-    agent._last_content_tools_all_housekeeping = False
-    agent._mute_post_response = False
-    agent._unicode_sanitization_passes = 0
+    # Reset unified retry counters for this turn.
+    agent._retry_counters = TurnRetryCounters()
+    agent._retry_counters.reset_all()
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
@@ -400,6 +394,9 @@ def build_turn_context(
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
 
+    # Initialize unified retry counters for this turn.
+    agent._retry_counters = TurnRetryCounters()
+
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
@@ -506,11 +503,7 @@ def build_turn_context(
                 conversation_history = conversation_history_after_compression(
                     agent, messages
                 )
-                agent._empty_content_retries = 0
-                agent._thinking_prefill_retries = 0
-                agent._last_content_with_tools = None
-                agent._last_content_tools_all_housekeeping = False
-                agent._mute_post_response = False
+                agent._retry_counters.reset_empty_response_group()
                 if not _compressor.should_compress(_preflight_tokens):
                     break
 
