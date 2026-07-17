@@ -2228,6 +2228,81 @@ def test_create_partial_session_context_no_subscribe(monkeypatch, worker_env):
     assert d["subscribed"] is False, d
 
 
+def test_create_explicit_notify_target_wins_over_empty_context(monkeypatch, worker_env):
+    """Variant A: orchestrator passes the USER's chat explicitly while the
+    live session ContextVars are empty (cleared finally-handler / no
+    gateway binding). The subscription MUST go to notify_chat_id, not be
+    skipped. This is the exact bug from t_3651470a."""
+    from tools import kanban_tools as kt
+    # Simulate an orchestrator context with no usable session vars.
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    out = kt._handle_create({
+        "title": "explicit notify target",
+        "assignee": "peer",
+        "notify_chat_id": "user-chat-99",
+        "notify_platform": "telegram",
+        "notify_thread_id": "user-thread-1",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "user-chat-99"
+    assert subs[0]["thread_id"] == "user-thread-1"
+
+
+def test_create_explicit_notify_target_wins_over_orchestrator_context(monkeypatch, worker_env):
+    """Variant A: even if the orchestrator's OWN session ContextVars are set
+    (e.g. it ran under a gateway), the explicit notify_* for the end user
+    must win — notifications go to the user, not the orchestrator's chat."""
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "orchestrator-chat")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "orchestrator-thread")
+
+    out = kt._handle_create({
+        "title": "explicit beats orchestrator context",
+        "assignee": "peer",
+        "notify_chat_id": "user-chat-7",
+        "notify_platform": "telegram",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "user-chat-7"
+
+
+def test_create_notify_chat_id_without_platform_is_ignored(monkeypatch, worker_env):
+    """notify_chat_id alone (no notify_platform) is ambiguous -> fall back to
+    ContextVars. With no ContextVars at all, that means no subscription."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    out = kt._handle_create({
+        "title": "notify chat without platform",
+        "assignee": "peer",
+        "notify_chat_id": "user-chat-99",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
     _maybe_auto_subscribe must NOT bubble that up and fail the parent
@@ -2681,3 +2756,193 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_create_originating_chat_from_context_no_explicit_notify(monkeypatch, worker_env):
+    """Requirement #1 (Variant A self-resolve): an orchestrator (Heisenberg)
+    calls kanban_create from a worker session WITHOUT passing notify_*, but the
+    gateway has stamped HERMES_SESSION_ORIGINATING_CHAT (= the user's chat) and
+    HERMES_SESSION_PLATFORM. The subscription MUST write to the user's chat
+    (6854590104), NOT be skipped and NOT go to the orchestrator's own session.
+    This is the exact bug from t_3651470a / t_5ccd80be.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Simulate gateway-stamped originating (user) chat on the live session.
+    monkeypatch.setenv("HERMES_SESSION_ORIGINATING_CHAT", "6854590104")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "orchestrator-chat-8865656784")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "heisenberg")
+
+    out = kt._handle_create({
+        "title": "fan-out child (user chat auto-resolved)",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1, subs
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "6854590104", subs
+    # MUST NOT have subscribed the orchestrator's own chat.
+    assert subs[0]["chat_id"] != "orchestrator-chat-8865656784"
+    # notifier_profile must be set so the watcher routes to the right bot.
+    assert subs[0]["notifier_profile"] == "heisenberg", subs
+
+
+def test_create_parent_inherits_notify_sub(monkeypatch, worker_env):
+    """Requirement #2: create a task (parent) with an explicit notify sub on
+    the USER's chat, then create a child (fan-out) WITHOUT passing notify_*.
+    The child MUST inherit the parent's subscription (chat_id + notifier_profile)
+    via task_links. Regression for the broken t.parents lookup in the prior
+    attempt.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Parent created with explicit user chat (Variant A).
+    p = json.loads(kt._handle_create({
+        "title": "parent orchestrator task",
+        "assignee": "heisenberg",
+        "notify_chat_id": "6854590104",
+        "notify_platform": "telegram",
+    }))
+    assert p["ok"] is True, p
+    assert p["subscribed"] is True, p
+    parent_tid = p["task_id"]
+
+    # Verify the parent's sub shape.
+    psubs = _sub_index(_list_subs_for_task(parent_tid))
+    assert psubs and psubs[0]["chat_id"] == "6854590104", psubs
+    assert psubs[0]["notifier_profile"] == "test-worker", psubs
+
+    # Child created WITHOUT notify_* — but linked to the parent.
+    c = json.loads(kt._handle_create({
+        "title": "child fan-out task",
+        "assignee": "peer",
+        "parents": [parent_tid],
+    }))
+    assert c["ok"] is True, c
+    assert c["subscribed"] is True, c
+    child_tid = c["task_id"]
+
+    # Child must carry the parent's user-chat sub, with the parent's profile.
+    csubs = _sub_index(_list_subs_for_task(child_tid))
+    assert len(csubs) == 1, csubs
+    assert csubs[0]["platform"] == "telegram"
+    assert csubs[0]["chat_id"] == "6854590104", csubs
+    assert csubs[0]["notifier_profile"] == "test-worker", csubs
+
+
+def test_create_no_context_no_notify_is_noop(monkeypatch, worker_env):
+    """Requirement #1 safety: when the orchestrator has NO session context
+    (cleared finally-handler, background) AND passes no notify_*, the create
+    must NOT subscribe anything — and therefore must NOT silently fall through
+    to a foreign bot. subscribed=False, no row written.
+    """
+    from tools import kanban_tools as kt
+
+    # Strip every session var so the context is fully empty (orchestrator
+    # running detached, exactly the bug-triggering condition).
+    for v in (
+        "HERMES_SESSION_ORIGINATING_CHAT",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_KEY",
+        "HERMES_SESSION_ID",
+        "HERMES_SESSION_PROFILE",
+    ):
+        monkeypatch.delenv(v, raising=False)
+
+    out = kt._handle_create({
+        "title": "detached orchestrator fan-out, no chat",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_create_resolves_profile_from_hermes_home_when_hermes_profile_unset(monkeypatch, worker_env, tmp_path):
+    """Root-cause fix for t_18688c49: inside a gateway worker the profile is
+    known from HERMES_HOME (the launcher exports it from ``--profile <name>``),
+    but HERMES_PROFILE / HERMES_SESSION_PROFILE are NOT exported. The
+    notifier_profile MUST be resolved from HERMES_HOME via
+    get_active_profile_name(), otherwise the watcher emits notifier_profile=NULL
+    and can't pick a bot -> silent skip / cross-profile mis-delivery.
+
+    This test simulates a Heisenberg gateway worker:
+      - HERMES_SESSION_PLATFORM + HERMES_SESSION_CHAT_ID set (live worker)
+      - HERMES_PROFILE / HERMES_SESSION_PROFILE UNSET (the real gateway bug)
+      - HERMES_HOME = <root>/profiles/heisenberg (what the launcher exports)
+    and asserts the subscription carries notifier_profile='heisenberg'.
+    """
+    from tools import kanban_tools as kt
+
+    # No explicit profile env — this is exactly what's missing in the gateway.
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+
+    # Simulate the launcher's HERMES_HOME export for `--profile heisenberg`.
+    # Path math in get_active_profile_name() only needs the *shape*
+    # <root>/profiles/<name>; no real dir needs to exist.
+    hermes_home = tmp_path / "fake_root" / "profiles" / "heisenberg"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    # Live worker session context (platform + chat), but NO session profile.
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "worker-chat-8865656784")
+    monkeypatch.delenv("HERMES_SESSION_ORIGINATING_CHAT", raising=False)
+
+    out = kt._handle_create({
+        "title": "heisenberg worker create, no HERMES_PROFILE env",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1, subs
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "worker-chat-8865656784", subs
+    # The crux: profile resolved from HERMES_HOME, not left NULL.
+    assert subs[0]["notifier_profile"] == "heisenberg", subs
+
+
+def test_resolve_process_profile_prefers_env_then_hermes_home(monkeypatch, tmp_path):
+    """Unit check of the profile resolver used by _maybe_auto_subscribe.
+
+    Priority: HERMES_PROFILE_NAME -> HERMES_PROFILE -> HERMES_HOME-derived
+    profile. get_active_profile_name() always yields a routable profile name
+    (e.g. "default" for the base install, the named profile when HERMES_HOME
+    is a profile dir) — it never returns None for a configured HERMES_HOME, so
+    the resolver returns a routable value, not None.
+    """
+    from tools import kanban_tools as kt
+
+    # HERMES_HOME shaped as a profile dir (<root>/profiles/<name>) resolves to
+    # the profile name regardless of whether it lives under ~/.hermes.
+    hermes_home = tmp_path / "root" / "profiles" / "heisenberg"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    assert kt._resolve_process_profile() == "heisenberg"
+
+    # HERMES_PROFILE wins over HERMES_HOME.
+    monkeypatch.setenv("HERMES_PROFILE", "walter")
+    assert kt._resolve_process_profile() == "walter"
+
+    # HERMES_PROFILE_NAME takes precedence over HERMES_PROFILE.
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "skyler")
+    assert kt._resolve_process_profile() == "skyler"
+
+    # With no env profile, derive from HERMES_HOME again.
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    assert kt._resolve_process_profile() == "heisenberg"
