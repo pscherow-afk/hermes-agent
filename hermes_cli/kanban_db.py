@@ -1548,6 +1548,44 @@ def _validate_sqlite_header(path: Path) -> None:
     )
 
 
+class KanbanSkillValidationError(RuntimeError):
+    """Raised by the dispatcher BEFORE spawning a worker when a task's
+    force-loaded ``skills`` reference a skill that does not exist on the
+    assignee profile's HERMES_HOME.
+
+    This is a *pre-spawn* failure: it must surface as a structured block
+    (block_reason='skill_not_found') instead of crashing the worker
+    subprocess, which would otherwise loop through the circuit breaker
+    burning CPU and leaving the task at 0% completion (#kanban-dispatch-skill-crash).
+
+    Carries the offending skill names and the profile they were checked
+    against so the operator gets an actionable diagnosis.
+    """
+
+    def __init__(
+        self,
+        missing_skills: list[str],
+        profile: str,
+        skills_dir: str,
+        *,
+        disabled: list[str] | None = None,
+    ):
+        self.missing_skills = list(missing_skills)
+        self.profile = profile
+        self.skills_dir = skills_dir
+        self.disabled = list(disabled or [])
+        disabled_note = ""
+        if self.disabled:
+            disabled_note = (
+                f" (note: {', '.join(self.disabled)} exist but are disabled)"
+            )
+        super().__init__(
+            f"Skill(s) not available on profile '{profile}': "
+            f"{', '.join(missing_skills)}{disabled_note}. "
+            f"Checked skills dir: {skills_dir}"
+        )
+
+
 class KanbanDbCorruptError(RuntimeError):
     """Raised when an existing kanban DB file fails integrity checks.
 
@@ -2384,6 +2422,121 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _skill_resolves_somewhere(skill_name: str, *, profile: Optional[str] = None) -> bool:
+    """Best-effort check that ``skill_name`` resolves in SOME profile/ext-dir.
+
+    Mirrors the cross-profile search the spawned worker actually performs
+    at runtime (see ``agent/skill_utils.py``: the assignee's profile
+    ``~/.hermes/<profile>/skills``, the master ``heisenberg`` profile when
+    the assignee is not heisenberg, and every ``skills.external_dirs`` /
+    ``HERMES_SKILLS_EXTRA_DIRS`` entry). We walk those directories for a
+    ``SKILL.md`` whose frontmatter ``name`` normalizes to ``skill_name``
+    (or whose directory slug normalizes to it) — the same matching the
+    worker's ``skill_view``/``get_skill_commands`` uses at load time.
+
+    Returns True if the skill resolves anywhere, False if it resolves
+    NOWHERE. A False result means the worker would crash on
+    ``hermes --skills <name>`` before doing any work (the class #1
+    pre-spawn failure), so the caller should reject the task up front.
+
+    Errors during inspection are swallowed as "could not confirm" → we
+    return True so a transient filesystem/permission hiccup never blocks a
+    task that might actually be loadable on the worker. Only a confident
+    "not found across every candidate dir" returns False.
+    """
+    from agent.skill_utils import (
+        iter_skill_index_files,
+        normalize_skill_lookup_name,
+    )
+    import yaml  # PyYAML is a hard Hermes dependency.
+
+    target = normalize_skill_lookup_name(skill_name)
+    if not target:
+        return False
+
+    # Build the list of candidate skills directories, respecting the same
+    # precedence the worker uses.
+    search_dirs: list = []
+    try:
+        from tools.skills_tool import _skills_dir
+        local = _skills_dir()
+        if local and local.exists():
+            search_dirs.append(local)
+    except Exception:
+        pass
+
+    # The assignee's profile skills dir (the worker boots with
+    # HERMES_HOME=profile_arg, so this is where it looks first).
+    if profile:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            prof_dir = get_profile_dir(
+                profile if profile != "default" else "default"
+            )
+            pskills = Path(prof_dir) / "skills"
+            if pskills.is_dir():
+                search_dirs.append(pskills)
+        except Exception:
+            pass
+
+    # The master/heisenberg profile — skills shared across the whole fleet.
+    # Only add it when it's a distinct dir from what we already have.
+    # Resolve relative to HERMES_HOME (not a hardcoded "~") so an isolated
+    # profile / test fixture that sets HERMES_HOME is inspected correctly.
+    try:
+        try:
+            from hermes_constants import get_hermes_home
+            _home = get_hermes_home()
+        except Exception:
+            _home = os.path.expanduser("~/.hermes")
+        master = Path(_home) / "profiles" / "heisenberg" / "skills"
+        if master.is_dir() and master.resolve() not in [
+            d.resolve() for d in search_dirs
+        ]:
+            search_dirs.append(master)
+    except Exception:
+        pass
+
+    # External dirs (config skills.external_dirs + the HERMES_SKILLS_EXTRA_DIRS
+    # env the dispatcher injects for cross-profile skill sharing).
+    try:
+        from agent.skill_utils import get_external_skills_dirs
+        for d in get_external_skills_dirs():
+            if d.resolve() not in [s.resolve() for s in search_dirs]:
+                search_dirs.append(d)
+    except Exception:
+        pass
+
+    if not search_dirs:
+        # Could not enumerate any dirs — don't block the task on our failure.
+        return True
+
+    for sdir in search_dirs:
+        try:
+            for md in iter_skill_index_files(Path(sdir), "SKILL.md"):
+                # Match by directory slug (the canonicalized skill key) ...
+                slug = md.parent.name.lower().replace(" ", "-").replace("_", "-")
+                if slug == target.lower():
+                    return True
+                # ... and by frontmatter `name` (normalizes identically).
+                try:
+                    content = md.read_text(encoding="utf-8", errors="ignore")
+                    fm = yaml.safe_load(content.split("---", 1)[-1].split("---", 1)[0]) \
+                        if content.startswith("---") else None
+                    if isinstance(fm, dict):
+                        nm = fm.get("name")
+                        if nm and normalize_skill_lookup_name(str(nm)) == target:
+                            return True
+                except Exception:
+                    # If frontmatter parse fails but the slug matched we'd
+                    # already have returned; a slug mismatch with unreadable
+                    # frontmatter is inconclusive per-file, so just continue.
+                    continue
+        except Exception:
+            continue
+    return False
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2536,6 +2689,40 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+        # ── Pre-spawn skill validation (class of failure #1) ──────────────
+        # Fail FAST here, before the task is ever enqueued for the
+        # dispatcher to spawn a worker. A task created with a skill name
+        # that exists in NO profile (not the assignee's profile, not the
+        # master/heisenberg profile, not any external dirs) cannot run: the
+        # worker crashes on `hermes --skills <missing>` with exit_code 1
+        # BEFORE producing any work, the dispatcher reaps it as crashed,
+        # and the task loops `ready → crashed → ready` until the circuit
+        # breaker trips and it lands in `gave_up` with 0% progress and a
+        # bare `Unknown skill(s)` line in the log.
+        #
+        # We resolve the skill against the SAME cross-profile search the
+        # worker will use at spawn time (see `resolve_skill_across_profiles`
+        # and the HERMES_SKILLS_EXTRA_DIRS wiring in agent/skill_utils.py),
+        # so a skill that genuinely exists somewhere in the profile graph
+        # is accepted and will load on the worker. Only names that resolve
+        # nowhere are rejected — turning a silent retry-storm into an
+        # immediate, actionable `create_task` ValueError.
+        if skills_list:
+            unknown_skills = [
+                name for name in skills_list
+                if not _skill_resolves_somewhere(name, profile=assignee)
+            ]
+            if unknown_skills:
+                quoted = ", ".join(repr(n) for n in unknown_skills)
+                raise ValueError(
+                    f"Unknown skill(s) requested via `skills=`: {quoted}. "
+                    f"None of the configured profiles (assignee={assignee!r}, "
+                    f"master/heisenberg, external_dirs) contain a skill with "
+                    f"that name. Fix the skill name before creating the task, "
+                    f"or drop the skill. List available skills with "
+                    f"`hermes skills list` (run as the target profile)."
+                )
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -7019,6 +7206,71 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+# Failure-cause taxonomy for the `gave_up` auto-block event.
+#
+# Before this classifier existed, a task that exhausted its retry budget
+# landed in `blocked` carrying only a bare `last_failure_error` string
+# (e.g. a single line `Unknown skill(s): hermes-agent`) and the operator
+# had no signal of *why* the circuit breaker tripped — only that it did.
+# Diagnosis required tailing worker logs. This classifier turns the raw
+# error text into a stable `failure_class` + `failure_hint` so the board
+# (and `hermes kanban tail`) can show an actionable reason at a glance.
+#
+# Classes (kept in sync with the three dispatcher defect classes tracked
+# in ADR-016 / kanban skill-crash fix):
+#   * skill_not_found   — worker crashed on `Unknown skill(s)`: the
+#                         pre-spawn guard (class #1) should have caught
+#                         this; if it still happens it means the resolver
+#                         diverged from the worker's load-time search.
+#   * rate_limited      — provider quota / 429 storm. Should NOT trip the
+#                         breaker (handled via KANBAN_RATE_LIMIT_EXIT_CODE),
+#                         but record it if it ever reaches here.
+#   * timed_out         — worker exceeded max_runtime_seconds.
+#   * crashed           — worker PID vanished (OOM / SIGKILL / clean-exit
+#                         protocol violation).
+#   * spawn_failed      — dispatcher could not launch the subprocess.
+#   * unknown           — none of the above matched; fall back to raw text.
+_FAILURE_CLASS_PATTERNS = [
+    ("skill_not_found", r"unknown skill", re.IGNORECASE),
+    ("skill_not_found", r"skill\(s\)? (not|requested)", re.IGNORECASE),
+    ("rate_limited", r"rate.?limit|quota|429|http 429", re.IGNORECASE),
+    ("timed_out", r"iteration budget exhausted|timed.?out|exceeded.*runtime", re.IGNORECASE),
+    ("crashed", r"crashed|worker pid|no longer alive|signal|oom", re.IGNORECASE),
+    ("spawn_failed", r"could not (launch|spawn)|spawn failed|subprocess", re.IGNORECASE),
+]
+
+
+def _classify_failure_cause(error: str, outcome: str) -> "tuple[str, str]":
+    """Map a failure's raw error text to a stable (class, hint).
+
+    Returns ``(failure_class, failure_hint)``. ``failure_class`` is one of
+    the ``_FAILURE_CLASS_PATTERNS`` keys (or ``outcome`` normalised, or
+    ``unknown``). ``failure_hint`` is a short human-readable summary the
+    board can display without forcing the operator to open worker logs.
+
+    Pure function: no DB access, safe to call from any path that records
+    a failure. Errors during classification are swallowed — the worst
+    outcome is a less specific class, never a raised exception.
+    """
+    text = (error or "").strip()
+    for cls, pat, _flags in _FAILURE_CLASS_PATTERNS:
+        try:
+            # NOTE: the third tuple element is the compiled-matching flag
+            # (re.IGNORECASE). It MUST be passed to re.search or every
+            # case-insensitive pattern silently no-ops and we fall through
+            # to the outcome-based fallback — which is exactly the bug that
+            # made `Unknown skill(s): ...` classify as `crashed` instead of
+            # `skill_not_found` (#kanban-dispatch-skill-crash class #2).
+            if re.search(pat, text, _flags):
+                return cls, text[:240]
+        except Exception:
+            continue
+    # Outcome-driven fallback when the error text is unconclusive.
+    if outcome in {"timed_out", "crashed", "spawn_failed"}:
+        return outcome, (text[:240] or f"outcome={outcome}")
+    return "unknown", (text[:240] or f"outcome={outcome}")
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7141,6 +7393,9 @@ def _record_task_failure(
                 "error": error[:500],
                 "trigger_outcome": outcome,
             }
+            failure_class, failure_hint = _classify_failure_cause(error, outcome)
+            payload["failure_class"] = failure_class
+            payload["failure_hint"] = failure_hint
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
@@ -7781,6 +8036,40 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # ── Pre-spawn skill guard (defense-in-depth for class #1) ──────
+        # `create_task` already rejects tasks whose `skills` resolve
+        # nowhere at enqueue time, but a task may have been created before
+        # that guard existed, or its skills dir may have been deleted after
+        # creation. Re-checking here — right before we spawn a worker
+        # subprocess — guarantees we NEVER launch a worker that will crash
+        # on `hermes --skills <missing>` with exit_code 1 and loop back
+        # into `gave_up` (the original crash class). A task that fails
+        # this check is blocked with a structured `skill_not_found`
+        # diagnosis instead of being spawned at all.
+        if claimed.skills:
+            _unresolved = [
+                s for s in claimed.skills
+                if s and not _skill_resolves_somewhere(s, profile=claimed.assignee)
+            ]
+            if _unresolved:
+                _msg = (
+                    "Pre-spawn skill validation failed: skill(s) "
+                    f"{', '.join(repr(u) for u in _unresolved)} do not resolve "
+                    f"on assignee profile {claimed.assignee!r} (checked assignee, "
+                    "master/heisenberg, and external skills dirs). The worker "
+                    "would crash on `hermes --skills <name>` before doing any "
+                    "work. Fix the skill name or restore the skill, then "
+                    "unblock the task."
+                )
+                _auto = _record_task_failure(
+                    conn, claimed.id, _msg,
+                    outcome="spawn_failed", failure_limit=failure_limit,
+                    release_claim=True, end_run=True,
+                    event_payload_extra={"failure_class": "skill_not_found"},
+                )
+                if _auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -8274,6 +8563,41 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Cross-profile skill sharing (class of failure #3): a task pinned to a
+    # specialist profile (e.g. `assignee=walter`, `skills=["hermes-agent"]`)
+    # spawns a worker that boots with `HERMES_HOME=<walter>` and therefore
+    # only sees walter's own `~/.hermes/walter/skills/`. The requested skill
+    # may live in the master `heisenberg` profile (shared fleet skills),
+    # NOT in the worker's profile — so the worker crashes on
+    # `hermes --skills hermes-agent` with `Unknown skill(s)` before doing
+    # any work, the dispatcher reaps it, and the task loops into `gave_up`.
+    #
+    # Fix: inject the master/heisenberg skills dir into the worker's
+    # `HERMES_SKILLS_EXTRA_DIRS` so `skill_view()`/`get_skill_commands()`
+    # search it as an external dir at load time (see agent/skill_utils.py
+    # `get_external_skills_dirs`). We MERGE with any value the dispatcher
+    # parent already exported, so we never clobber a previous hop's dirs.
+    # Resolve the master/heisenberg profile's skills dir relative to the
+    # dispatcher's HERMES_HOME (not a hardcoded "~"), so isolated-profile /
+    # test fixtures that set HERMES_HOME get correct cross-profile sharing
+    # (class of failure #3). The default Hermes layout places profiles
+    # under <HERMES_HOME>/profiles/<name>/skills.
+    try:
+        from hermes_constants import get_hermes_home
+        _master_skills = os.path.join(
+            get_hermes_home(), "profiles", "heisenberg", "skills"
+        )
+    except Exception:
+        _master_skills = os.path.expanduser("~/.hermes/profiles/heisenberg/skills")
+    if os.path.isdir(_master_skills):
+        _existing_extra = env.get("HERMES_SKILLS_EXTRA_DIRS", "")
+        _existing_parts = [
+            p for p in _existing_extra.split(os.pathsep) if p.strip()
+        ]
+        if _master_skills not in _existing_parts:
+            _existing_parts.append(_master_skills)
+        env["HERMES_SKILLS_EXTRA_DIRS"] = os.pathsep.join(_existing_parts)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

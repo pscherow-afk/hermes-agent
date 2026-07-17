@@ -51,14 +51,30 @@ from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
 
 _log = logging.getLogger(__name__)
 
-# Exact paths that accept non-interactive bearer-token auth. A route registers
-# itself here at import/startup; the seam only acts on registered paths.
+# Exact paths (or path templates) that accept non-interactive bearer-token
+# auth. A route registers itself here at import/startup; the seam only acts
+# on registered paths. Templates use FastAPI ``{param}`` syntax — a request
+# path matches a template if it shares the same static prefix up to the first
+# ``{`` (e.g. ``/api/memory/profile/{name}`` guards
+# ``/api/memory/profile/walter``).
 _token_routes: set[str] = set()
 _lock = threading.Lock()
 
 
+def _template_prefix(path: str) -> str:
+    """Return the static prefix of a path (everything before the first '{').
+
+    For a non-template path this is the path itself. For
+    ``/api/memory/profile/{name}`` it is ``/api/memory/profile/``.
+    """
+    idx = path.find("{")
+    if idx == -1:
+        return path
+    return path[:idx]
+
+
 def register_token_route(path: str) -> None:
-    """Mark ``path`` (exact match) as token-authable.
+    """Mark ``path`` (exact match or path template) as token-authable.
 
     Idempotent. Call at module import / app setup so the seam knows which
     routes to guard. Registering a route does NOT make it public — it makes
@@ -69,9 +85,23 @@ def register_token_route(path: str) -> None:
 
 
 def is_token_route(path: str) -> bool:
-    """True if ``path`` was registered as token-authable (exact match)."""
+    """True if ``path`` was registered as token-authable.
+
+    Matches either an exact registered path or any registered path template
+    whose static prefix the request path starts with.
+    """
     with _lock:
-        return path in _token_routes
+        if path in _token_routes:
+            return True
+        for route in _token_routes:
+            prefix = _template_prefix(route)
+            # Exact (non-template) routes were already checked above. Only
+            # template routes (prefix != route) use prefix matching, and the
+            # prefix must end with '/' or the path segment boundary must match
+            # so '/api/memory/profileX' does NOT match '/api/memory/profile/'.
+            if prefix != route and path.startswith(prefix):
+                return True
+        return False
 
 
 def clear_token_routes() -> None:

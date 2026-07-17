@@ -576,6 +576,85 @@ class TestComponentFilter:
         ))
 
 
+class TestDedupFilter:
+    """Unit tests for _DedupFilter (P0-6: suppress repeated log lines)."""
+
+    def test_normalize_strips_time_tokens(self):
+        a = "Subsequent auxiliary calls will skip it until 04:03:49."
+        b = "Subsequent auxiliary calls will skip it until 04:03:50."
+        assert hermes_logging._dedup_normalize(a) == hermes_logging._dedup_normalize(b)
+
+    def test_normalize_keeps_distinct_messages(self):
+        assert hermes_logging._dedup_normalize("provider openrouter unhealthy") != \
+            hermes_logging._dedup_normalize("provider nous unhealthy")
+
+    def test_suppresses_identical_within_window(self):
+        f = hermes_logging._DedupFilter(window_seconds=60.0)
+        rec = logging.LogRecord(
+            "agent.auxiliary_client", logging.WARNING, "", 0,
+            "Auxiliary Nous client unavailable (run: hermes auth).", (), None
+        )
+        assert f.filter(rec) is True    # first pass
+        assert f.filter(rec) is False   # suppressed repeat
+
+    def test_allows_after_window_elapses(self, monkeypatch):
+        f = hermes_logging._DedupFilter(window_seconds=60.0)
+        rec = logging.LogRecord(
+            "agent.auxiliary_client", logging.WARNING, "", 0,
+            "Auxiliary Nous client unavailable (run: hermes auth).", (), None
+        )
+        assert f.filter(rec) is True
+        monkeypatch.setattr(hermes_logging.time, "monotonic", lambda: 2_000_000.0)
+        assert f.filter(rec) is True  # window expired -> logged again
+
+    def test_distinct_levels_not_suppressed(self):
+        f = hermes_logging._DedupFilter(window_seconds=60.0)
+        msg = "Auxiliary Nous client unavailable (run: hermes auth)."
+        warn = logging.LogRecord("agent.auxiliary_client", logging.WARNING, "", 0, msg, (), None)
+        info = logging.LogRecord("agent.auxiliary_client", logging.INFO, "", 0, msg, (), None)
+        assert f.filter(warn) is True
+        assert f.filter(info) is True  # different level -> separate key
+
+    def test_window_zero_disables(self):
+        f = hermes_logging._DedupFilter(window_seconds=0)
+        rec = logging.LogRecord("a.b", logging.WARNING, "", 0, "repeat", (), None)
+        assert f.filter(rec) is True
+        assert f.filter(rec) is True
+
+
+class TestDedupInstalledOnHandlers:
+    """Ensure setup_logging attaches exactly one _DedupFilter to every file
+    handler, and that it actually suppresses child-logger burst records
+    (root-logger filters would NOT catch those — see module docstring)."""
+
+    def test_single_dedup_filter_per_handler(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home, force=True)
+        for h in hermes_logging.rotating_file_handlers():
+            dedups = [f for f in h.filters if isinstance(f, hermes_logging._DedupFilter)]
+            assert len(dedups) == 1
+
+    def test_suppresses_child_logger_burst(self, hermes_home):
+        import io
+        hermes_logging.setup_logging(hermes_home=hermes_home, force=True)
+        # Capture via a fresh handler on agent's logger chain.
+        root = logging.getLogger()
+        buf = io.StringIO()
+        cap = logging.StreamHandler(buf)
+        cap.setLevel(logging.DEBUG)
+        cap.setFormatter(logging.Formatter("%(message)s"))
+        cap.addFilter(hermes_logging._DedupFilter(window_seconds=60.0))
+        root.addHandler(cap)
+        try:
+            log = logging.getLogger("agent.auxiliary_client")
+            for _ in range(5):
+                log.warning("Auxiliary Nous client unavailable (run: hermes auth).")
+        finally:
+            root.removeHandler(cap)
+        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+        # Only the first occurrence should survive the 60s window.
+        assert len(lines) == 1, lines
+
+
 class TestComponentPrefixes:
     """COMPONENT_PREFIXES covers the expected components."""
 
@@ -732,8 +811,12 @@ class TestAddRotatingHandler:
 
         handlers = [h for h in hermes_logging.rotating_file_handlers() if isinstance(h, RotatingFileHandler)]
         assert len(handlers) == 1
-        # No _SessionFilter on the handler — record factory handles it
-        assert len(handlers[0].filters) == 0
+        # No _SessionFilter on the handler — record factory handles it.
+        # A _DedupFilter is expected (P0-6 repeating-record suppressor).
+        session_filters = [f for f in handlers[0].filters
+                           if type(f).__name__ == "_SessionFilter"]
+        assert session_filters == []
+        assert any(isinstance(f, hermes_logging._DedupFilter) for f in handlers[0].filters)
 
         # But session_tag still works (via record factory)
         hermes_logging.set_session_context("factory_test")

@@ -22,6 +22,11 @@ would add indirection without clarifying anything.
 
 This module is dependency-free so it can be unit-tested in isolation and
 imported by the turn loop without an import cycle.
+
+The dataclass also exposes two convenience methods used by the loop:
+``reset_primary_recovery()`` (clears the one-shot primary-transport guard when
+a fallback provider is activated) and ``summarize()`` (renders fired guards for
+retry/fallback log lines).
 """
 
 from __future__ import annotations
@@ -78,3 +83,25 @@ class TurnRetryState:
         # Convenience for debugging / tests: iterate (name, value) pairs.
         for f in fields(self):
             yield f.name, getattr(self, f.name)
+
+    def reset_primary_recovery(self) -> None:
+        """Clear the one-shot primary-transport recovery guard.
+
+        Called when a fallback provider is activated: the freshly-activated
+        provider must get a clean primary-recovery attempt rather than being
+        blocked by the flag set for the *previous* provider. The outer loop
+        also resets ``retry_count`` / ``compression_attempts`` (loop locals,
+        intentionally not on this object) alongside this call.
+        """
+        self.primary_recovery_attempted = False
+
+    def summarize(self) -> str:
+        """One-line snapshot of fired recovery guards, for fallback/retry logs.
+
+        Returns an empty string when no guard has fired, so callers can skip
+        logging entirely on a clean attempt.
+        """
+        fired = [name for name, value in self if value is True]
+        if not fired:
+            return ""
+        return "retry-guards={" + ",".join(fired) + "}"

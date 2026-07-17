@@ -10,6 +10,8 @@ Two-phase design:
 
 from unittest.mock import MagicMock, patch
 
+import types
+
 import pytest
 
 from run_agent import AIAgent
@@ -46,7 +48,7 @@ def _make_agent(
     agent.suppress_status_output = False
     agent._stream_consumers = []
     agent._executing_tools = False
-    agent._mute_post_response = False
+    agent._retry_counters = types.SimpleNamespace(mute_post_response=False)
     agent.status_callback = None
     agent.tool_progress_callback = None
     agent._compression_warning = None

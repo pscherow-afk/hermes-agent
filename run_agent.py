@@ -3490,6 +3490,13 @@ class AIAgent:
         if not (user_text and response_text):
             return
         try:
+            # ── Auto-memory extraction hook (P1b) ──────────────────────────
+            # Post-turn safety net: a cheap aux LLM proposes durable facts
+            # from the just-completed turn; high-confidence ones auto-save,
+            # the rest stage for approval. OFF unless memory.auto_extract is
+            # true in config.yaml. Best-effort: never blocks the user.
+            self._run_auto_memory_extraction(user_text, response_text)
+
             sync_kwargs = {"session_id": self.session_id or ""}
             if messages is not None:
                 sync_kwargs["messages"] = messages
@@ -3504,6 +3511,74 @@ class AIAgent:
             )
         except Exception:
             pass
+
+    def _run_auto_memory_extraction(
+        self, user_text: str, response_text: str
+    ) -> None:
+        """Post-turn auto-memory extraction hook (P1b).
+
+        Called from ``_sync_external_memory_for_turn`` for every completed,
+        non-interrupted turn. Reads the ``memory.auto_extract`` /
+        ``memory.auto_extract_threshold`` config and the ``memory.write_approval``
+        gate, then proposes candidate facts and routes them (auto-save high
+        confidence, stage the rest).
+
+        Strictly best-effort: any failure is swallowed so a misconfigured
+        aux provider or full memory store can never cost the user latency or a
+        crash on their completed turn.
+        """
+        # Built-in memory must be the active backend for auto-save to land
+        # anywhere meaningful. If neither store is enabled, skip entirely.
+        if not (getattr(self, "_memory_enabled", False)
+                or getattr(self, "_user_profile_enabled", False)):
+            return
+        # Resolve config lazily so CLI / gateway share config.yaml.
+        try:
+            from hermes_cli.config import load_config as _load_config
+            _cfg = _load_config() or {}
+            mem_cfg = _cfg.get("memory") if isinstance(_cfg, dict) else None
+            if not isinstance(mem_cfg, dict):
+                mem_cfg = {}
+        except Exception:
+            return
+
+        auto_extract = bool(mem_cfg.get("auto_extract", False))
+        if not auto_extract:
+            return
+        threshold = float(mem_cfg.get("auto_extract_threshold", 0.85))
+
+        # The write-approval gate overrides everything: if the user has gated
+        # memory writes, every proposed fact stages for approval (no silent
+        # auto-save), reusing the /memory pending review flow.
+        approval_required = False
+        try:
+            from tools.write_approval import write_approval_enabled
+            approval_required = write_approval_enabled("memory")
+        except Exception:
+            pass
+
+        try:
+            from agent.auto_memory import AutoMemoryExtractor
+
+            extractor = AutoMemoryExtractor(
+                auto_extract=True,
+                threshold=threshold,
+                approval_required=approval_required,
+            )
+            result = extractor.run(
+                user_text=user_text,
+                response_text=response_text,
+                memory_store=getattr(self, "_memory_store", None),
+            )
+            if result.auto_saved or result.staged:
+                logger.info(
+                    "auto_memory: +%d saved, +%d staged (candidates=%d)",
+                    len(result.auto_saved),
+                    len(result.staged),
+                    len(result.candidates),
+                )
+        except Exception as e:  # pragma: no cover - defence in depth
+            logger.debug("auto_memory extraction failed: %s", e, exc_info=True)
 
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.

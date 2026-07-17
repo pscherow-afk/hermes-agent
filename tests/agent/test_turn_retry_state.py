@@ -65,3 +65,32 @@ def test_guards_are_independently_mutable():
     # untouched guards stay False
     assert s.has_retried_429 is False
     assert s.anthropic_auth_retry_attempted is False
+
+
+def test_reset_primary_recovery_clears_guard():
+    s = TurnRetryState()
+    s.primary_recovery_attempted = True
+    s.has_retried_429 = True  # unrelated guard — must survive the reset
+    s.reset_primary_recovery()
+    assert s.primary_recovery_attempted is False
+    assert s.has_retried_429 is True
+
+
+def test_reset_primary_recovery_is_noop_when_unset():
+    s = TurnRetryState()
+    s.reset_primary_recovery()
+    assert s.primary_recovery_attempted is False
+
+
+def test_summarize_empty_on_fresh_state():
+    assert TurnRetryState().summarize() == ""
+
+
+def test_summarize_lists_fired_guards():
+    s = TurnRetryState()
+    s.has_retried_429 = True
+    s.image_shrink_retry_attempted = True
+    out = s.summarize()
+    assert "has_retried_429" in out
+    assert "image_shrink_retry_attempted" in out
+    assert out.startswith("retry-guards={")
