@@ -35,6 +35,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Optional, Sequence
@@ -229,6 +230,68 @@ class _ComponentFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         return record.name.startswith(self._prefixes)
+
+
+import re as _re
+
+# Matches time-of-day tokens (HH:MM:SS / HH:MM) and bare 10-digit unix
+# timestamps that some log lines embed — e.g. the auxiliary_client
+# "Subsequent auxiliary calls will skip it until 04:03:49." warning.  We
+# strip these before dedup-keying so the *same* warning emitted a second
+# apart isn't treated as a distinct message.
+_DUP_TIME_TOKEN_RE = _re.compile(
+    r"\b\d{1,2}:\d{2}(:\d{2})?\b|\b\d{10}\b"
+)
+
+
+def _dedup_normalize(message: str) -> str:
+    """Collapse time/version tokens so near-identical log lines share a
+    single dedup key."""
+    return _DUP_TIME_TOKEN_RE.sub("", message)
+
+
+class _DedupFilter(logging.Filter):
+    """Suppress repeated, near-identical log records within a short window.
+
+    Some code paths emit the same warning dozens of times per minute (e.g.
+    ``auxiliary_client`` marking a provider unhealthy in a retry loop).  This
+    filter keeps at most one record per (logger, level, normalized-message)
+    every ``window_seconds`` (default 60), returning ``False`` for the extra
+    copies so they never reach a handler.
+
+    The window is intentionally short — the first occurrence is always
+    logged, so the operator still sees what happened; only the burst
+    repetition is suppressed.
+    """
+
+    window_seconds: float = 60.0
+
+    def __init__(self, window_seconds: float = 60.0) -> None:
+        super().__init__()
+        self.window_seconds = float(window_seconds)
+        self._last_seen: dict = {}
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self.window_seconds <= 0:
+            return True  # dedup disabled
+        key = (
+            record.name,
+            record.levelno,
+            _dedup_normalize(record.getMessage()),
+        )
+        now = time.monotonic()
+        with self._lock:
+            last = self._last_seen.get(key)
+            if last is not None and (now - last) < self.window_seconds:
+                return False
+            self._last_seen[key] = now
+        return True
+
+    def reset(self) -> None:
+        """Clear the dedup cache (test-isolation helper)."""
+        with self._lock:
+            self._last_seen.clear()
 
 
 # Logger name prefixes that belong to each component.
@@ -754,6 +817,15 @@ def _add_rotating_handler(
     handler.setFormatter(formatter)
     if log_filter is not None:
         handler.addFilter(log_filter)
+    # Attach the repeating-record suppressor (idempotent — guarded by a
+    # marker attribute so repeated setup_logging() calls never stack copies).
+    # It is attached to the *handler* (not the root logger) because Python's
+    # logging only applies a logger's own filters to records emitted on that
+    # logger; the root logger's filters do NOT run for child-logger records,
+    # so a root-level filter would silently miss every agent.* warning.
+    if not getattr(handler, "_hermes_dedup_attached", False):
+        handler.addFilter(_DedupFilter(window_seconds=60.0))
+        handler._hermes_dedup_attached = True  # type: ignore[attr-defined]
     # Route through the async queue instead of ``logger.addHandler(handler)`` so
     # the rotation-lock wait never runs on the caller's (often event-loop) thread.
     _register_queued_handler(handler)

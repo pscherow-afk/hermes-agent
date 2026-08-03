@@ -558,6 +558,39 @@ def get_external_skills_dirs() -> List[Path]:
         else:
             logger.debug("External skills dir does not exist, skipping: %s", p)
 
+    # Cross-profile skill sharing (class of failure #3). The kanban
+    # dispatcher injects the master/heisenberg profile's skills dir into
+    # each spawned worker's HERMES_SKILLS_EXTRA_DIRS so a specialist
+    # worker (which boots with HERMES_HOME=<specialist>) can still resolve
+    # fleet-shared skills that live only in the heisenberg profile.
+    # Honor that env var here as an additional, highest-precedence
+    # external dir source — these dirs are operator-asserted (the
+    # dispatcher set them), so we treat existing-but-absent entries as a
+    # silent skip rather than an error.
+    extra_env = os.environ.get("HERMES_SKILLS_EXTRA_DIRS", "")
+    if extra_env:
+        for entry in extra_env.split(os.pathsep):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                expanded = os.path.expanduser(os.path.expandvars(entry))
+                p = Path(expanded).resolve()
+            except Exception:
+                continue
+            if p == local_skills:
+                continue
+            if p in seen:
+                continue
+            if p.is_dir():
+                seen.add(p)
+                result.append(p)
+            else:
+                logger.debug(
+                    "HERMES_SKILLS_EXTRA_DIRS entry does not exist, skipping: %s",
+                    p,
+                )
+
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result

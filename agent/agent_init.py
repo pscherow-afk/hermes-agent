@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
+from agent.turn_retry_counters import TurnRetryCounters
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
@@ -1397,6 +1398,7 @@ def init_agent(
     else:
         agent._fallback_chain = []
     agent._fallback_index = 0
+    agent._retry_counters = TurnRetryCounters()
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
@@ -2788,6 +2790,19 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
+    # Recovery/retry counters referenced by the conversation loop's
+    # thinking-only and empty-response handling.  They are assigned deeper in
+    # the loop (after compaction / during recovery branches), but the
+    # thinking-only prefill branch can read ``_thinking_prefill_retries``
+    # before any of those assignments run — on a reasoning model that emits a
+    # thinking-only first response.  Seed them here so the attribute always
+    # exists.  (Bugfix for "'AIAgent' object has no attribute
+    # '_thinking_prefill_retries'".)
+    agent._thinking_prefill_retries = 0
+    agent._empty_content_retries = 0
+    agent._last_content_with_tools = None
+    agent._last_content_tools_all_housekeeping = False
+    agent._mute_post_response = False
 
 
 __all__ = ["init_agent"]

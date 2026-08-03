@@ -682,6 +682,65 @@ memory:
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
+  # ── Auto-memory extraction hook (post-turn) ───────────────────────────
+  # When ON, a cheap auxiliary LLM proposes durable facts from each completed
+  # turn. High-confidence candidates are auto-saved; the rest stage for
+  # approval (surfaced via `/memory pending`, or inline on interactive CLI).
+  # Requires at least one of memory_enabled / user_profile_enabled above.
+  # OFF by default — the agent's own `memory` tool remains the primary path.
+  auto_extract: false
+  # Confidence (0.0-1.0) at/above which a candidate is auto-saved
+  # instead of staged. Lower = more aggressive auto-save (noisier memory).
+  auto_extract_threshold: 0.85
+
+  # Memory provider plugin (optional): "builtin" (default), "vector", "honcho", "hindsight", etc.
+  # When set to "vector", the vector memory provider is activated with the settings below.
+  # provider: ""
+
+  # Vector memory provider configuration (used when provider: vector)
+  vector:
+    # Backend: pgvector, qdrant, chroma, or mcp
+    backend: pgvector
+
+    # Embedding settings
+    embedding_model: "text-embedding-3-small"  # OpenAI model
+    embedding_dim: 1536
+    # Or use local embeddings:
+    # use_local_embeddings: true
+    # local_embedding_model: "all-MiniLM-L6-v2"
+    # local_embedding_dim: 384
+
+    # Search settings
+    search_top_k: 10
+    similarity_threshold: 0.7
+
+    # pgvector settings (PostgreSQL with pgvector extension)
+    pgvector:
+      connection_string: ""  # postgresql://user:pass@host:port/db
+      table_name: "memory_embeddings"
+
+    # qdrant settings
+    qdrant:
+      url: "http://localhost:6333"
+      api_key: ""  # optional
+      collection_name: "hermes_memory"
+
+    # chroma settings
+    chroma:
+      persist_directory: "~/.hermes/chroma"
+      collection_name: "hermes_memory"
+
+    # MCP server configuration (alternative to native clients)
+    mcp:
+      servers: []
+      # Example:
+      # servers:
+      #   - name: "qdrant"
+      #     command: "npx"
+      #     args: ["-y", "@modelcontextprotocol/server-qdrant"]
+      #     env:
+      #       QDRANT_URL: "http://localhost:6333"
+
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================

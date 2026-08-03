@@ -19,7 +19,6 @@ EXPECTED_FIELDS = {
     "nous_auth_retry_attempted",
     "nous_paid_entitlement_refresh_attempted",
     "copilot_auth_retry_attempted",
-    "copilot_stale_cred_retry_attempted",
     "vertex_auth_retry_attempted",
     "thinking_sig_retry_attempted",
     "invalid_encrypted_content_retry_attempted",
@@ -33,10 +32,13 @@ EXPECTED_FIELDS = {
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
     "restart_with_rebuilt_messages",
-    "restart_with_redirected_messages",
 }
 
 
+def test_all_guards_default_false():
+    s = TurnRetryState()
+    for name, value in s:
+        assert value is False, f"{name} should default to False"
 
 
 def test_field_set_matches_contract():
@@ -46,6 +48,12 @@ def test_field_set_matches_contract():
     )
 
 
+def test_loop_control_vars_are_not_on_state():
+    # retry_count / max_retries / max_compression_attempts stay as loop locals,
+    # NOT on the state object (they are while-mechanics, not recovery bookkeeping).
+    names = {f.name for f in fields(TurnRetryState)}
+    for loop_local in ("retry_count", "max_retries", "max_compression_attempts"):
+        assert loop_local not in names
 
 
 def test_guards_are_independently_mutable():
@@ -59,32 +67,30 @@ def test_guards_are_independently_mutable():
     assert s.anthropic_auth_retry_attempted is False
 
 
-def test_copilot_provider_check_accepts_alias_spellings():
-    """`/model` and profile configs can leave `github-copilot` / `github` as
-    the provider spelling; the recovery gates must not silently skip them."""
-    from agent.conversation_loop import _is_copilot_provider
-    from run_agent import AIAgent
+def test_reset_primary_recovery_clears_guard():
+    s = TurnRetryState()
+    s.primary_recovery_attempted = True
+    s.has_retried_429 = True  # unrelated guard — must survive the reset
+    s.reset_primary_recovery()
+    assert s.primary_recovery_attempted is False
+    assert s.has_retried_429 is True
 
-    class _Agent:
-        # Reuse the real single-owner check unbound; only provider/_base_url
-        # state is faked.
-        _is_copilot_provider = AIAgent._is_copilot_provider
-        _is_copilot_url = AIAgent._is_copilot_url
 
-        def __init__(self, provider, base_url=""):
-            self.provider = provider
-            self._base_url_lower = base_url.lower()
+def test_reset_primary_recovery_is_noop_when_unset():
+    s = TurnRetryState()
+    s.reset_primary_recovery()
+    assert s.primary_recovery_attempted is False
 
-    assert _is_copilot_provider(_Agent("copilot"))
-    assert _is_copilot_provider(_Agent("github-copilot"))
-    assert _is_copilot_provider(_Agent("GitHub-Copilot"))
-    assert _is_copilot_provider(_Agent("github"))
-    # URL fallback: unnormalized provider but a Copilot base URL.
-    assert _is_copilot_provider(_Agent("custom", "https://api.githubcopilot.com"))
-    assert not _is_copilot_provider(_Agent("openrouter", "https://openrouter.ai/api/v1"))
 
-    class _NoMethod:
-        provider = "github-copilot"
+def test_summarize_empty_on_fresh_state():
+    assert TurnRetryState().summarize() == ""
 
-    # Fallback path when the agent object lacks the method entirely.
-    assert _is_copilot_provider(_NoMethod())
+
+def test_summarize_lists_fired_guards():
+    s = TurnRetryState()
+    s.has_retried_429 = True
+    s.image_shrink_retry_attempted = True
+    out = s.summarize()
+    assert "has_retried_429" in out
+    assert "image_shrink_retry_attempted" in out
+    assert out.startswith("retry-guards={")

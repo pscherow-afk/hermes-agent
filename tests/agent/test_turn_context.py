@@ -243,7 +243,7 @@ def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)
     # Retry counters reset, guardrails reset, vision re-armed, turn counted.
-    assert agent._invalid_tool_retries == 0
+    assert agent._retry_counters.invalid_tool_retries == 0
     assert agent._tool_guardrails.reset_called is True
     assert agent._vision_supported is True
     assert agent._user_turn_count == 1
