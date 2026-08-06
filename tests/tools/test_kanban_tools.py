@@ -80,6 +80,124 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+# ---------------------------------------------------------------------------
+# Circuit breaker: kanban_show retry-loop protection
+# ---------------------------------------------------------------------------
+
+
+def test_show_breaker_allows_first_identical_retry(worker_env):
+    """First identical retry is tolerated (transient error recovery)."""
+    from tools import kanban_tools as kt
+    # Reset breaker state for this test.
+    kt._show_breaker_reset(worker_env)
+    try:
+        input_hash = kt._show_sanitized_input_hash(worker_env, None)
+        sig = "TypeError: 'str' object cannot be interpreted as an integer"
+
+        # First failure: recorded, no block.
+        kt._show_breaker_record_failure(worker_env, input_hash, sig)
+        assert kt._show_breaker_blocks(worker_env, input_hash) is None
+
+        # Second identical failure: count=2, max=1, blocks.
+        kt._show_breaker_record_failure(worker_env, input_hash, sig)
+        block = kt._show_breaker_blocks(worker_env, input_hash)
+        assert block is not None
+        assert "circuit breaker tripped" in block
+        assert "TOOL_FAILURE_REQUIRES_INTERVENTION" in block
+    finally:
+        kt._show_breaker_reset(worker_env)
+
+
+def test_show_breaker_resets_on_success(worker_env):
+    """A successful call resets the breaker for that task."""
+    from tools import kanban_tools as kt
+    kt._show_breaker_reset(worker_env)
+    try:
+        input_hash = kt._show_sanitized_input_hash(worker_env, None)
+        sig = "TypeError: 'str' object cannot be interpreted as an integer"
+
+        # One failure → state exists.
+        kt._show_breaker_record_failure(worker_env, input_hash, sig)
+        assert kt._show_breaker_blocks(worker_env, input_hash) is None
+
+        # Success resets.
+        kt._show_breaker_record_success(worker_env)
+        assert kt._show_breaker_blocks(worker_env, input_hash) is None
+    finally:
+        kt._show_breaker_reset(worker_env)
+
+
+def test_show_breaker_resets_on_changed_input(worker_env):
+    """A different input_hash resets the breaker."""
+    from tools import kanban_tools as kt
+    kt._show_breaker_reset(worker_env)
+    try:
+        hash_a = kt._show_sanitized_input_hash(worker_env, "board-a")
+        hash_b = kt._show_sanitized_input_hash(worker_env, "board-b")
+        sig = "TypeError: 'str' object cannot be interpreted as an integer"
+
+        # Fail with board-a.
+        kt._show_breaker_record_failure(worker_env, hash_a, sig)
+        kt._show_breaker_record_failure(worker_env, hash_a, sig)
+        assert kt._show_breaker_blocks(worker_env, hash_a) is not None
+
+        # Board-b is a different input → reset.
+        assert kt._show_breaker_blocks(worker_env, hash_b) is None
+    finally:
+        kt._show_breaker_reset(worker_env)
+
+
+def test_show_breaker_resets_on_different_error(worker_env):
+    """A different error signature resets the breaker."""
+    from tools import kanban_tools as kt
+    kt._show_breaker_reset(worker_env)
+    try:
+        input_hash = kt._show_sanitized_input_hash(worker_env, None)
+
+        # Fail with error A twice.
+        kt._show_breaker_record_failure(worker_env, input_hash, "TypeError: A")
+        kt._show_breaker_record_failure(worker_env, input_hash, "TypeError: A")
+        assert kt._show_breaker_blocks(worker_env, input_hash) is not None
+
+        # Error B is different → reset.
+        kt._show_breaker_record_failure(worker_env, input_hash, "ValueError: B")
+        assert kt._show_breaker_blocks(worker_env, input_hash) is None
+    finally:
+        kt._show_breaker_reset(worker_env)
+
+
+def test_show_breaker_happy_path_not_blocked(worker_env):
+    """A successful call never triggers the breaker."""
+    from tools import kanban_tools as kt
+    kt._show_breaker_reset(worker_env)
+    try:
+        out = kt._handle_show({})
+        d = json.loads(out)
+        assert "task" in d
+        assert d["task"]["id"] == worker_env
+    finally:
+        kt._show_breaker_reset(worker_env)
+
+
+def test_show_breaker_error_signature_format():
+    """Error signature captures type + first line of message."""
+    from tools import kanban_tools as kt
+    exc = TypeError("'str' object cannot be interpreted as an integer")
+    sig = kt._show_error_signature(exc)
+    assert sig == "TypeError: 'str' object cannot be interpreted as an integer"
+    assert "'str'" in sig
+
+
+def test_show_breaker_input_hash_uses_board(worker_env):
+    """Different board values produce different hashes."""
+    from tools import kanban_tools as kt
+    h1 = kt._show_sanitized_input_hash(worker_env, None)
+    h2 = kt._show_sanitized_input_hash(worker_env, "board-x")
+    assert h1 != h2
+    assert len(h1) == 16
+    assert len(h2) == 16
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
