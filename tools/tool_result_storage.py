@@ -20,13 +20,21 @@ Defense against context-window overflow operates at three levels:
    MAX_TURN_BUDGET_CHARS (200K), the largest non-persisted results are
    spilled to disk until the aggregate is under budget. This catches cases
    where many medium-sized results combine to overflow context.
+
+4. **Tool-output compaction** (compact_tool_result): Optional feature-flag
+   layer for paid execution profiles. Stores full output as an artifact
+   on disk and injects a compact summary + excerpt + artifact_id instead
+   of the full raw result. Controlled by `agent.tool_output_compaction`
+   in config.yaml. Aims to reduce fresh input tokens.
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
 import shlex
+import time
 import uuid
 
 from tools.budget_config import (
@@ -252,3 +260,199 @@ def enforce_turn_budget(
             )
 
     return tool_messages
+
+
+# ── Layer 4: Tool-output compaction (feature-flag) ──────────────
+
+COMPACT_OUTPUT_TAG = "<compacted-output>"
+COMPACT_OUTPUT_CLOSING_TAG = "</compacted-output>"
+
+
+_COMPACTION_DEFAULT = {"enabled": False, "threshold": 5000, "excerpt_size": 500}
+_COMPACTION_CACHE_TTL_S = 30.0
+_compaction_cache: list = []  # [monotonic_ts, config_dict]
+
+
+def _read_compaction_config() -> dict:
+    """Read the tool_output_compaction config section.
+
+    Returns a dict with keys: enabled, threshold, excerpt_size.
+    Defaults to disabled when config is inaccessible.
+
+    Result is cached for a short TTL so the per-tool-call overhead of
+    re-reading config.yaml is amortized across a turn.
+    """
+    now = time.monotonic()
+    if _compaction_cache and now - _compaction_cache[0] < _COMPACTION_CACHE_TTL_S:
+        return _compaction_cache[1]
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        agent_cfg = cfg.get("agent", {})
+        compaction = agent_cfg.get("tool_output_compaction", {})
+        if not isinstance(compaction, dict):
+            compaction = _COMPACTION_DEFAULT
+    except Exception:
+        compaction = _COMPACTION_DEFAULT
+    _compaction_cache[:] = [now, compaction]
+    return compaction
+
+
+def _compact_summary(content: str) -> str:
+    """Generate a one-line summary of the tool output content.
+
+    For JSON content, describes the structure (keys for dict, count for list).
+    Otherwise uses the first meaningful line of content.
+    """
+    if not content:
+        return "Empty result"
+
+    first_line = content.split("\n", 1)[0].strip()
+    if first_line:
+        # Try to parse JSON and extract a meaningful summary
+        if first_line.startswith("{"):
+            try:
+                data = json.loads(content[:2000])
+                if isinstance(data, dict):
+                    keys = list(data.keys())
+                    return f"JSON object with keys: {', '.join(keys[:5])}{'...' if len(keys) > 5 else ''}"
+                if isinstance(data, list):
+                    return f"JSON array of {len(data)} items"
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if first_line.startswith("["):
+            try:
+                data = json.loads(content[:2000])
+                if isinstance(data, list):
+                    return f"JSON array of {len(data)} items"
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Use the first meaningful line
+        if len(first_line) > 120:
+            return first_line[:117] + "..."
+        if first_line:
+            return first_line
+    size_kb = len(content) / 1024
+    return f"Tool result ({size_kb:.1f} KB)"
+
+
+def _format_compact_block(
+    content: str,
+    excerpt: str,
+    artifact_id: str,
+    original_size: int,
+    remote_path: str,
+) -> str:
+    """Build the <compacted-output> replacement block."""
+    size_kb = original_size / 1024
+    if size_kb >= 1024:
+        size_str = f"{size_kb / 1024:.1f} MB"
+    else:
+        size_str = f"{size_kb:.1f} KB"
+
+    compact_summary = _compact_summary(content)
+
+    msg = f"{COMPACT_OUTPUT_TAG}\n"
+    msg += f"Tool result: {compact_summary}\n"
+    msg += f"Size: {original_size:,} chars ({size_str})\n"
+    msg += f"Artifact: {artifact_id}\n"
+    msg += f"Full output saved to: {remote_path}\n"
+    msg += "Use read_file with the path above to access the full output.\n"
+    msg += "\n"
+    msg += f"Excerpt:\n{excerpt}\n"
+    msg += f"{COMPACT_OUTPUT_CLOSING_TAG}"
+    return msg
+
+
+def compact_tool_result(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+) -> str:
+    """Layer 4: compact tool output for paid execution profiles.
+
+    When the feature flag ``agent.tool_output_compaction.enabled`` is True
+    in config.yaml, outputs larger than the configured threshold are saved
+    to disk as artifacts and replaced with a compact summary + excerpt +
+    artifact_id. This reduces fresh input tokens for paid models.
+
+    The full output is written to the same sandbox storage dir as the
+    existing persistence layer (``/tmp/hermes-results/``), so read_file
+    can access it regardless of terminal backend.
+
+    Args:
+        content: Raw tool result string.
+        tool_name: Name of the tool (for logging).
+        tool_use_id: Unique ID for this tool call (used as filename).
+        env: The active BaseEnvironment instance, or None.
+
+    Returns:
+        Original content if compaction is disabled or content is small,
+        or <compacted-output> replacement block.
+    """
+    compaction = _read_compaction_config()
+    if not compaction.get("enabled", False):
+        return content
+
+    threshold = int(compaction.get("threshold", 5000))
+    excerpt_size = int(compaction.get("excerpt_size", 500))
+
+    if len(content) <= threshold:
+        return content
+
+    # Skip multimodal results (they are already compact representations)
+    from agent.tool_dispatch_helpers import _is_multimodal_tool_result
+
+    if _is_multimodal_tool_result(content):
+        return content
+
+    # Skip already-persisted/compacted content (don't double-wrap)
+    if COMPACT_OUTPUT_TAG in content or PERSISTED_OUTPUT_TAG in content:
+        return content
+
+    storage_dir = _resolve_storage_dir(env)
+    filename = _safe_result_filename(tool_use_id)
+    remote_path = f"{storage_dir}/{filename}"
+    artifact_id = f"tool:{tool_name}/{tool_use_id}"
+
+    excerpt, has_more = generate_preview(content, max_chars=excerpt_size)
+
+    # Write full content to sandbox
+    write_ok = False
+    if env is not None:
+        try:
+            write_ok = _write_to_sandbox(content, remote_path, env)
+        except Exception as exc:
+            logger.warning(
+                "Compaction sandbox write failed for %s: %s", tool_use_id, exc
+            )
+
+    if write_ok:
+        logger.info(
+            "Compacted tool result: %s (%s, %d chars -> %s)",
+            tool_name, tool_use_id, len(content), remote_path,
+        )
+        return _format_compact_block(
+            content=content,
+            excerpt=excerpt + ("\n..." if has_more else ""),
+            artifact_id=artifact_id,
+            original_size=len(content),
+            remote_path=remote_path,
+        )
+
+    # If sandbox write failed, still compact inline (no artifact reference)
+    logger.info(
+        "Inline-compacting tool result: %s (%d chars, no sandbox write)",
+        tool_name, len(content),
+    )
+    continuation = "\n..." if has_more else ""
+    return (
+        f"{COMPACT_OUTPUT_TAG}\n"
+        f"Tool result: {_compact_summary(content)}\n"
+        f"Size: {len(content):,} chars\n"
+        f"Excerpt:\n{excerpt}\n"
+        f"{continuation}\n"
+        f"{COMPACT_OUTPUT_CLOSING_TAG}"
+    )

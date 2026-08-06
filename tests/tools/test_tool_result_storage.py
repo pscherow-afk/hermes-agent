@@ -18,6 +18,9 @@ from tools.tool_result_storage import (
     _resolve_storage_dir,
     _safe_result_filename,
     _write_to_sandbox,
+    compact_tool_result,
+    COMPACT_OUTPUT_TAG,
+    COMPACT_OUTPUT_CLOSING_TAG,
     enforce_turn_budget,
     generate_preview,
     maybe_persist_tool_result,
@@ -320,3 +323,149 @@ class TestPerToolThresholds:
             assert val == 100_000
         except ImportError:
             pytest.skip("file_tools not importable in test env")
+
+
+# ── Layer 4: Tool-output compaction ──────────────────────────────────
+
+_COMPACTION_ENABLED = {
+    "enabled": True,
+    "threshold": 5_000,
+    "excerpt_size": 500,
+}
+
+
+def _patch_compaction_config(monkeypatch, cfg: dict):
+    """Point the compaction config cache at ``cfg`` and clear the TTL cache."""
+    import time as _time
+    import tools.tool_result_storage as trs
+
+    monkeypatch.setattr(trs, "_compaction_cache", [_time.monotonic(), cfg])
+
+
+class TestCompactToolResult:
+    """Feature-flag compaction: summary + excerpt + artifact_id."""
+
+    def test_disabled_by_default_returns_unchanged(self, monkeypatch):
+        _patch_compaction_config(monkeypatch, {"enabled": False})
+        content = "x" * 10_000
+        result = compact_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_off",
+            env=None,
+        )
+        assert result == content
+
+    def test_small_content_returns_unchanged(self, monkeypatch):
+        _patch_compaction_config(monkeypatch, _COMPACTION_ENABLED)
+        content = "small"
+        result = compact_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_small",
+            env=None,
+        )
+        assert result == content
+
+    def test_large_content_compacted_with_artifact(self, monkeypatch):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        _patch_compaction_config(monkeypatch, _COMPACTION_ENABLED)
+        content = "\n".join(f"line {i} - " + "x" * 80 for i in range(200))
+        result = compact_tool_result(
+            content=content,
+            tool_name="search_files",
+            tool_use_id="tc_big",
+            env=env,
+        )
+        assert result.startswith(COMPACT_OUTPUT_TAG)
+        assert result.endswith(COMPACT_OUTPUT_CLOSING_TAG)
+        assert "Artifact: tool:search_files/tc_big" in result
+        assert "Full output saved to:" in result
+        assert len(result) < len(content)
+        # Excerpt contains the first meaningful line
+        assert "line 0" in result
+        # Full content persisted to sandbox via stdin
+        assert env.execute.call_args[1]["stdin_data"] == content
+
+    def test_excerpt_respects_excerpt_size(self, monkeypatch):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        _patch_compaction_config(
+            monkeypatch,
+            {"enabled": True, "threshold": 100, "excerpt_size": 300},
+        )
+        content = "a" * 5_000
+        result = compact_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_excerpt",
+            env=env,
+        )
+        excerpt_part = result.split("Excerpt:")[1].split("</compacted-output>")[0]
+        # Excerpt capped at ~300 chars + continuation marker
+        assert len(excerpt_part.strip()) <= 305
+        assert "..." in excerpt_part
+
+    def test_json_summary_describes_structure(self, monkeypatch):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        _patch_compaction_config(monkeypatch, _COMPACTION_ENABLED)
+        content = '{"status": "ok", "items": [1, 2, 3]}' + " " * 6_000
+        result = compact_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_json",
+            env=env,
+        )
+        assert "JSON object with keys: status, items" in result
+
+    def test_already_persisted_not_double_wrapped(self, monkeypatch):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        _patch_compaction_config(monkeypatch, _COMPACTION_ENABLED)
+        content = (
+            f"{PERSISTED_OUTPUT_TAG}\nFull output saved to: /tmp/x.txt\n"
+            f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+        )
+        result = compact_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_persisted",
+            env=env,
+        )
+        assert result == content
+        env.execute.assert_not_called()
+
+    def test_sandbox_write_failure_falls_back_to_inline(self, monkeypatch):
+        env = MagicMock()
+        env.execute.side_effect = Exception("sandbox down")
+        _patch_compaction_config(monkeypatch, _COMPACTION_ENABLED)
+        content = "x" * 10_000
+        result = compact_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_nosandbox",
+            env=env,
+        )
+        assert result.startswith(COMPACT_OUTPUT_TAG)
+        assert result.endswith(COMPACT_OUTPUT_CLOSING_TAG)
+        # No artifact reference when write failed — still inline excerpt
+        assert "Artifact:" not in result
+        assert "Excerpt:" in result
+        assert len(result) < len(content)
+
+    def test_compact_summary_empty(self):
+        from tools.tool_result_storage import _compact_summary
+
+        assert _compact_summary("") == "Empty result"
+
+    def test_config_cache_ttl(self, monkeypatch):
+        """Config cache respects TTL so per-call config reads are amortized."""
+        import time as _time
+        import tools.tool_result_storage as trs
+
+        # Seed cache with a config, verify it's served without re-read
+        trs._compaction_cache[:] = [_time.monotonic(), {"enabled": True}]
+        cfg = trs._read_compaction_config()
+        assert cfg["enabled"] is True

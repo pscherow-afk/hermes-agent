@@ -246,6 +246,20 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+
+        # Tool-output compaction: store full output as artifact and inject
+        # summary + excerpt + artifact_id instead of the full raw result.
+        # Aims to reduce fresh input tokens for paid execution profiles.
+        # Feature-flag: default off, opt-in via config.yaml.
+        "tool_output_compaction": {
+            "enabled": False,
+            # Compaction threshold in chars — outputs larger than this are
+            # compacted. Lower than the persistence threshold (100K) to catch
+            # medium-sized outputs that drive fresh input cost.
+            "threshold": 5_000,
+            # Max chars of the excerpt kept inline after compaction.
+            "excerpt_size": 500,
+        },
     },
 
     "terminal": {
