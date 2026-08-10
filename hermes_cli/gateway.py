@@ -2911,17 +2911,17 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         path_entries.extend(common_bin_paths)
         sane_path = ":".join(path_entries)
         return f"""[Unit]
-Description={SERVICE_DESCRIPTION}
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
+        Description={SERVICE_DESCRIPTION}
+        After=network-online.target
+        Wants=network-online.target
+        StartLimitIntervalSec=0
 
-[Service]
-Type={systemd_type}
-{systemd_watchdog_directives}User={username}
-Group={group_name}
-ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
-WorkingDirectory={working_dir}
+        [Service]
+        Type={systemd_type}
+        {systemd_watchdog_directives}User={username}
+        Group={group_name}
+        ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run --replace
+        WorkingDirectory={working_dir}
 Environment="HOME={home_dir}"
 Environment="USER={username}"
 Environment="LOGNAME={username}"
@@ -2954,33 +2954,33 @@ WantedBy=multi-user.target
     path_entries.extend(common_bin_paths)
     sane_path = ":".join(path_entries)
     return f"""[Unit]
-Description={SERVICE_DESCRIPTION}
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
+    Description={SERVICE_DESCRIPTION}
+    After=network-online.target
+    Wants=network-online.target
+    StartLimitIntervalSec=0
 
-[Service]
-Type={systemd_type}
-{systemd_watchdog_directives}ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
-WorkingDirectory={working_dir}
-Environment="PATH={sane_path}"
-Environment="VIRTUAL_ENV={venv_dir}"
-Environment="HERMES_HOME={hermes_home}"
-Restart=always
-RestartSec=5
-RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
-RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
-KillMode=mixed
-KillSignal=SIGTERM
-ExecReload=/bin/kill -USR1 $MAINPID
-ExecStopPost=-{python_path} -m gateway.cgroup_cleanup
-TimeoutStopSec={restart_timeout}
-StandardOutput=journal
-StandardError=journal
+    [Service]
+    Type={systemd_type}
+    {systemd_watchdog_directives}ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run --replace
+    WorkingDirectory={working_dir}
+    Environment="PATH={sane_path}"
+    Environment="VIRTUAL_ENV={venv_dir}"
+    Environment="HERMES_HOME={hermes_home}"
+    Restart=always
+    RestartSec=5
+    RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
+    RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
+    KillMode=mixed
+    KillSignal=SIGTERM
+    ExecReload=/bin/kill -USR1 $MAINPID
+    ExecStopPost=-{python_path} -m gateway.cgroup_cleanup
+    TimeoutStopSec={restart_timeout}
+    StandardOutput=journal
+    StandardError=journal
 
-[Install]
-WantedBy=default.target
-"""
+    [Install]
+    WantedBy=default.target
+    """
 
 
 def _normalize_service_definition(text: str) -> str:
