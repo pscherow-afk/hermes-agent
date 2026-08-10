@@ -3668,7 +3668,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
             task_id=r["task_id"],
             author=r["author"],
             body=r["body"],
-            created_at=r["created_at"],
+            created_at=int(r["created_at"]),
         )
         for r in rows
     ]
@@ -3695,7 +3695,7 @@ def list_comments_after(
             task_id=r["task_id"],
             author=r["author"],
             body=r["body"],
-            created_at=r["created_at"],
+            created_at=int(r["created_at"]),
         )
         for r in rows
     ]
@@ -3877,9 +3877,9 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             filename=r["filename"],
             stored_path=r["stored_path"],
             content_type=r["content_type"],
-            size=r["size"] or 0,
+            size=int(r["size"]) if r["size"] is not None else 0,
             uploaded_by=r["uploaded_by"],
-            created_at=r["created_at"],
+            created_at=int(r["created_at"]),
         )
         for r in rows
     ]
@@ -3897,9 +3897,9 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         filename=r["filename"],
         stored_path=r["stored_path"],
         content_type=r["content_type"],
-        size=r["size"] or 0,
+        size=int(r["size"]) if r["size"] is not None else 0,
         uploaded_by=r["uploaded_by"],
-        created_at=r["created_at"],
+        created_at=int(r["created_at"]),
     )
 
 
@@ -3944,7 +3944,7 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
                 task_id=r["task_id"],
                 kind=r["kind"],
                 payload=payload,
-                created_at=r["created_at"],
+                created_at=int(r["created_at"]),
                 run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
             )
         )
@@ -9995,7 +9995,7 @@ def unseen_events_for_sub(
             payload = None
         out.append(Event(
             id=r["id"], task_id=r["task_id"], kind=r["kind"],
-            payload=payload, created_at=r["created_at"],
+            payload=payload, created_at=int(r["created_at"]),
             run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
         ))
         max_id = max(max_id, int(r["id"]))
