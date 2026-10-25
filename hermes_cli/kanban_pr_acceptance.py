@@ -5,6 +5,8 @@ receipts only after rechecking the captured run/status/contract under its lock.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import json
 import re
 import subprocess
@@ -12,6 +14,37 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+
+
+class GhInfraError(Exception):
+    """gh could not produce acceptance evidence (auth/network/gh crash), NOT a
+    problem with the PR itself. Carries a short, non-secret failure class so the
+    receipt can report the real cause instead of a catch-all string.
+    """
+
+    def __init__(self, exit_code: int | None, category: str, message: str = ""):
+        self.exit_code = exit_code
+        self.category = category
+        super().__init__(message or f"gh failed: {category} (exit={exit_code})")
+
+
+def _classify_gh_failure(stderr: str) -> str:
+    """Map gh's stderr (may contain secrets/host details) to a short category.
+
+    The raw stderr is never surfaced in the receipt.
+    """
+    head = (stderr or "").splitlines()[0].lower() if stderr else ""
+    if "rate limit" in head or ("403" in head and "rate" in head):
+        return "rate_limit"
+    if "401" in head or "unauthorized" in head or "authentication" in head:
+        return "auth"
+    if "404" in head or "not found" in head or "could not resolve" in head:
+        return "not_found"
+    if "dial tcp" in head or "connection" in head or "timeout" in head or "tls" in head:
+        return "network"
+    if "graphql" in head:
+        return "graphql"
+    return "gh_error"
 
 
 def validate_contract(value: str | None) -> str:
@@ -22,15 +55,30 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
-def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
+def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+         allow_404: bool = False) -> Any:
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
         command += ["--paginate", "--slurp"]
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            text=True, timeout=30, check=True)
-    value = json.loads(result.stdout)
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise GhInfraError(None, "timeout") from None
+    except OSError as e:
+        raise GhInfraError(None, "gh_spawn", str(e)) from None
+    if result.returncode != 0:
+        if allow_404 and "404" in (result.stderr or ""):
+            # No branch-protection rules apply to this ref: an empty set, not an
+            # infrastructure failure — keep it out of the infra classification.
+            return [] if paginate else {}
+        raise GhInfraError(result.returncode, _classify_gh_failure(result.stderr))
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise GhInfraError(result.returncode, "bad_response") from e
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
@@ -38,7 +86,7 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
 
 def collect_acceptance(contract: str, published_pr: str | None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               "pr_url": published_pr, "checks": [], "gh_error": None,
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
@@ -54,14 +102,22 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
-        pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
+        data = _api("graphql", query=query)
+        repository = (data.get("data") or {}).get("repository")
+        if repository is None:
+            raise ValueError("Repository not accessible or does not exist")
+        pr = repository.get("pullRequest")
+        if pr is None:
+            raise ValueError("PR not found at the declared repository")
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        # A 404 here means no branch-protection rules apply to the base ref.
+        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                     paginate=True, allow_404=True)
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -103,9 +159,23 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
         return receipt
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
-        # Never persist gh stderr (credentials/host details); the failed phase is actionable.
-        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
+    except GhInfraError as e:
+        # gh itself failed to deliver evidence — distinct from the PR being wrong.
+        receipt.update(
+            classification="infra",
+            detail=f"GitHub acceptance evidence unavailable: gh call failed ({e.category}, exit={e.exit_code}). "
+                   f"Check gh authentication/API access and retry; use kanban_block if it persists.",
+            gh_error={"exit_code": e.exit_code, "category": e.category},
+        )
+        return receipt
+    except (ValueError, KeyError, TypeError, IndexError) as e:
+        # The PR or its data is the problem (closed, missing, unmatched, or GitHub
+        # returned an unexpected shape) — never an infrastructure failure.
+        receipt.update(
+            classification="unmatched",
+            detail=f"PR acceptance data problem: {e}",
+            gh_error=None,
+        )
         return receipt
 
 

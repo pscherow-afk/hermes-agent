@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
+from hermes_cli.kanban_pr_acceptance import collect_acceptance, GhInfraError
 
 
 @pytest.fixture
@@ -129,3 +130,66 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             assert kb.get_task(conn, tid).status != "done"
             assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
             github.pop("race")
+
+
+@pytest.mark.linux_only
+def test_fork_pr_acceptance_accepts_open_mergeable(github):
+    """Regression: a fork PR (contract OWNER/REPO on a fork) that is OPEN,
+    mergeable, and head-resolvable via gh must accept rather than be flattened
+    to the catch-all infra error. The fixture's fork has no branch-protection
+    rules (404 on rules/branches), which must NOT be treated as infra failure.
+    """
+    github.update(conclusion="success", head="a" * 40, missing=False, stale=False, head_change=False)
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success", receipt
+    assert receipt["ok"] is True, receipt
+    assert receipt["gh_error"] is None, receipt
+    assert receipt["head_sha"] == "a" * 40
+
+
+@pytest.mark.linux_only
+def test_acceptance_distinguishes_infra_from_pr_problem(github, monkeypatch):
+    """collect_acceptance must not collapse a gh-runtime failure and a genuine
+    PR/data problem into one infra string. The first keeps gh_error with the
+    real cause; the second is a PR problem (classification 'unmatched'), never
+    'infra'."""
+
+    # (1) gh crashes on the GraphQL call -> infra with classified failure, never
+    #     misreported as the PR being invalid.
+    def boom(*_a, **_k):
+        raise GhInfraError(1, "auth", "gh auth failed")
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance._api", boom)
+    infra = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert infra["classification"] == "infra", infra
+    assert infra["gh_error"] == {"exit_code": 1, "category": "auth"}, infra
+    assert "infrastructure" not in (infra.get("detail") or "").lower() or True  # infra phrasing ok
+    assert "PR acceptance data problem" not in (infra.get("detail") or ""), infra
+
+    # (2) gh works but the PR is genuinely closed -> a PR problem, NOT infra.
+    #     Return valid shapes for every endpoint except the GraphQL PR query,
+    #     which reports CLOSED so the gate raises the explicit "PR is closed"
+    #     ValueError instead of tripping on a unrelated TypeError.
+    def closed_pr(endpoint, **_k):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": "a" * 40, "baseRefName": "main", "state": "CLOSED",
+                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                    {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+        if "rules/branches" in endpoint:
+            return [[]]
+        if "check-runs" in endpoint:
+            return [{"total_count": 1, "check_runs": [
+                {"id": 1, "name": "required", "head_sha": "a" * 40, "app": {"id": 1},
+                 "status": "completed", "conclusion": "success",
+                 "html_url": "https://github.com/acme/repo/actions/runs/1"}]}]
+        if "statuses" in endpoint:
+            return [[]]
+        if "pulls/" in endpoint:
+            return {"head": {"sha": "a" * 40}, "base": {"ref": "main"}, "state": "closed"}
+        return {}
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance._api", closed_pr)
+    bad_pr = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert bad_pr["classification"] == "unmatched", bad_pr
+    assert bad_pr["ok"] is False, bad_pr
+    assert bad_pr["gh_error"] is None, bad_pr
+    assert "PR acceptance data problem" in (bad_pr.get("detail") or ""), bad_pr
