@@ -9255,6 +9255,7 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             run_id = None
+            _end_run_closed = False
             if end_run:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
@@ -9269,6 +9270,7 @@ def _record_task_failure(
                         "retry_status": retry_status,
                     },
                 )
+                _end_run_closed = run_id is not None
             payload = {
                 "failures": failures,
                 "effective_limit": effective_limit,
@@ -9279,9 +9281,16 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
-            _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
-            )
+            # Suppress the gave_up event only when end_run was requested but
+            # found no active run — that means a kanban_complete already
+            # finalized the task and this is a raced late exit path (false
+            # "gave up" for a done task, #t_2d81f72d). When end_run=False the
+            # breaker genuinely flipped the task to blocked, so the event MUST
+            # fire even with run_id=None.
+            if not (end_run and not _end_run_closed):
+                _append_event(
+                    conn, task_id, "gave_up", payload, run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.
@@ -9312,15 +9321,20 @@ def _record_task_failure(
                         "retry_status": retry_status,
                     },
                 )
-                _append_event(
-                    conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
-                    run_id=run_id,
-                )
+                # No active run to close ⇒ the task already reached a terminal
+                # state (e.g. a kanban_complete won the race). Appending a
+                # terminal event here would emit a false "will retry" for an
+                # already-finished task. (#t_2d81f72d)
+                if run_id is not None:
+                    _append_event(
+                        conn, task_id, outcome,
+                        {
+                            "error": error[:500],
+                            "failures": failures,
+                            "retry_status": retry_status,
+                        },
+                        run_id=run_id,
+                    )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
 
@@ -11760,6 +11774,22 @@ def unseen_events_for_sub(
             run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
         ))
         max_id = max(max_id, int(r["id"]))
+    # A task that is already done/archived (completed_at set) cannot have a
+    # genuine subsequent timed_out/crashed/gave_up — those are leftovers from an
+    # exit path that raced a kanban_complete. Drop them so the notifier never
+    # emits a false "will retry"/"crashed" for a finished task (#t_2d81f72d).
+    # The cursor still advances past them above, so they are never re-notified.
+    _STALE_TERMINAL_KINDS = ("timed_out", "crashed", "gave_up")
+    if any(ev.kind in _STALE_TERMINAL_KINDS for ev in out):
+        _trow = conn.execute(
+            "SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            _trow is not None
+            and _trow["status"] in ("done", "archived")
+            and _trow["completed_at"] is not None
+        ):
+            out = [ev for ev in out if ev.kind not in _STALE_TERMINAL_KINDS]
     return max_id, out
 
 
