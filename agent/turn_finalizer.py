@@ -58,6 +58,15 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db_dispatch as _kbd
         _conn = _kbc.connect()
         try:
+            # No-op when the task already reached a terminal state (a
+            # kanban_complete may have won the race). Recording a terminal
+            # outcome here would append a bogus timed_out event for an
+            # already-finished task (#t_2d81f72d).
+            _row = _conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?", (kanban_task,)
+            ).fetchone()
+            if _row is None or _row["status"] in ("done", "archived") or _row["current_run_id"] is None:
+                return
             _kbd._record_task_failure(
                 _conn,
                 kanban_task,

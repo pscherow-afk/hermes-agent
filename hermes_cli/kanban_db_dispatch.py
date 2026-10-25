@@ -1053,11 +1053,16 @@ def _record_task_failure(
                     conn, task_id, outcome=outcome, status=outcome, error=error,
                     metadata={"failures": failures, "retry_status": retry_status},
                 )
-                _kb._append_event(
-                    conn, task_id, outcome,
-                    {"error": error, "failures": failures, "retry_status": retry_status},
-                    run_id=run_id,
-                )
+                # No active run to close ⇒ the task already reached a terminal
+                # state (e.g. a kanban_complete won the race). Appending a
+                # terminal event here would emit a false "will retry" for an
+                # already-finished task. (#t_2d81f72d)
+                if run_id is not None:
+                    _kb._append_event(
+                        conn, task_id, outcome,
+                        {"error": error, "failures": failures, "retry_status": retry_status},
+                        run_id=run_id,
+                    )
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
@@ -1079,6 +1084,7 @@ def _record_task_failure(
             "retry_status": retry_status,
         }
         run_id = None
+        _end_run_closed = False
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
@@ -1091,9 +1097,16 @@ def _record_task_failure(
                     "retry_status": retry_status,
                 },
             )
+            _end_run_closed = run_id is not None
         if event_payload_extra:
             payload.update(event_payload_extra)
-        _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        # Suppress the gave_up event only when end_run was requested but found no
+        # active run — that means a kanban_complete already finalized the task and
+        # this is a raced late exit path (false "gave up" for a done task,
+        # #t_2d81f72d). When end_run=False the breaker genuinely flipped the task
+        # to blocked, so the event MUST fire even with run_id=None.
+        if not (end_run and not _end_run_closed):
+            _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 
 

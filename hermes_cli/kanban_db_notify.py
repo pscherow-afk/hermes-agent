@@ -333,6 +333,22 @@ def unseen_events_for_sub(
         params.extend(kind_list)
     rows = conn.execute(q, params).fetchall()
     out = [_kb.Event.from_row(r) for r in rows]
+    # A task that is already done/archived (completed_at set) cannot have a
+    # genuine subsequent timed_out/crashed/gave_up — those are leftovers from an
+    # exit path that raced a kanban_complete. Drop them so the notifier never
+    # emits a false "will retry"/"crashed" for a finished task (#t_2d81f72d).
+    # The cursor still advances past them below, so they are never re-notified.
+    _STALE_TERMINAL_KINDS = ("timed_out", "crashed", "gave_up")
+    if any(ev.kind in _STALE_TERMINAL_KINDS for ev in out):
+        _trow = conn.execute(
+            "SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            _trow is not None
+            and _trow["status"] in ("done", "archived")
+            and _trow["completed_at"] is not None
+        ):
+            out = [ev for ev in out if ev.kind not in _STALE_TERMINAL_KINDS]
     max_id = max([cursor, *(int(r["id"]) for r in rows)])
     return max_id, out
 
