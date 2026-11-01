@@ -30,8 +30,10 @@ from plugins.memory.holographic.store import MemoryStore
         ("the and of", None),  # None = sentinel for fallback-to-raw
         # empty string → empty output
         ("", ""),
-        # FTS5 operator characters stripped
-        ("context: length-probe", {"context", "lengthprobe"}),
+        # hyphen is a FTS5 word separator -> becomes a space-separated phrase
+        # literal, NOT a fused token (the old bug fused "length-probe" into
+        # "lengthprobe").
+        ("context: length-probe", {"context", "length probe"}),
         # trailing punctuation stripped by tokenizer
         ("hello, world!", {"hello", "world"}),
     ],
@@ -93,6 +95,68 @@ def test_prefetch_recovers_prose_query(retriever_with_facts):
     assert len(results) >= 1
     # The top hit should be the deployment rollback fact
     assert "deployment rollback" in results[0]["content"].lower()
+
+
+def test_hyphenated_query_matches_fact(retriever_with_facts):
+    """Regression for the wb-pipeline bug: a hyphen in the query must NOT be
+    deleted. FTS5 tokenizes 'wb-pipeline' into 'wb' + 'pipeline', so the
+    sanitizer must split on the hyphen ('wb-pipeline' -> 'wb' OR 'pipeline'),
+    not fuse it into 'wbpipeline' (a token that never exists in the index).
+
+    The seeded fact below contains the hyphenated name, so a correct sanitize
+    returns it; the old code returned [].
+    """
+    store = retriever_with_facts.store
+    store.add_fact(
+        content="wb-pipeline ships through deploy_wb_pipeline.sh on the release train.",
+        category="project",
+    )
+    # The exact hyphenated name as a query must surface the fact.
+    results = retriever_with_facts.search("wb-pipeline")
+    matched = [r for r in results if "wb-pipeline" in r["content"]]
+    assert matched, f"hyphenated query 'wb-pipeline' returned no match: {results!r}"
+
+    # The same holds for a mix of hyphenated + plain tokens in prose.
+    prose_results = retriever_with_facts.search("how to deploy wb-pipeline")
+    assert any("wb-pipeline" in r["content"] for r in prose_results), (
+        f"hyphenated prose query returned no match: {prose_results!r}"
+    )
+
+
+def test_other_fts_operators_do_not_break_match():
+    """The remaining FTS5 operator chars ('(', ')', '*', '^', ':', '+', '"')
+    must be stripped rather than emitted into a quoted phrase. If any leaked
+    inside a literal, the MATCH would raise a syntax error and _fts_candidates
+    would swallow it (-> zero hits). Verify the sanitized output is valid FTS5:
+    no operator inside a literal, and it executes without raising.
+
+    NB: these operators (unlike '-') are pure syntax, so stripping them is still
+    correct; we only assert the query is well-formed and runnable, not that it
+    matches a particular fused token.
+    """
+    import re
+    import sqlite3
+
+    query = 'context*length (probe)^colon:plus+quote"'
+    result = FactRetriever._sanitize_fts_query(query)
+    assert result, "sanitizer returned empty for a query with operators"
+    # Every quoted phrase literal must contain only word chars / spaces; no
+    # operator char may sit inside a literal (that would be invalid FTS5).
+    for literal in re.findall(r'"([^"]*)"', result):
+        assert re.fullmatch(r"[A-Za-z0-9 ]+", literal), (
+            f"operator leaked into phrase literal: {literal!r}"
+        )
+    # The whole expression must be safe to feed to SQLite FTS5 MATCH: build a
+    # doc from the surviving tokens and assert it runs without a syntax error
+    # and returns that doc.
+    surviving = [m for m in re.findall(r'"([^"]*)"', result)]
+    assert surviving, "no phrase literals survived sanitization"
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+    doc = " ".join(surviving)
+    conn.execute("INSERT INTO t(body) VALUES (?)", (doc,))
+    rows = conn.execute("SELECT body FROM t WHERE t MATCH ?", (result,)).fetchall()
+    assert rows, f"sanitized query {result!r} raised/matched nothing in FTS5"
 
 
 
