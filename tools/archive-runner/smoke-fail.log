@@ -1,0 +1,4 @@
+self-test: nvidia/nemotron-3-ultra-550b-a55b:free -> 429; trying next candidate
+self-test: all candidate models unavailable (429/timeout/error)
+RESULT model=None elapsed=0.43s
+SMOKE_FAIL_EXPECTED_OK
