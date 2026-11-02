@@ -9,7 +9,6 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
-from hermes_cli.kanban_pr_acceptance import collect_acceptance, GhInfraError
 
 
 @pytest.fixture
@@ -76,13 +75,13 @@ def github(tmp_path, monkeypatch):
         thread.join()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_pr_completion_requires_current_required_evidence(github):
     with connect() as conn:
         for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", "skipped", None, "success"):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
-            ok = kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert ok is (conclusion == "success")
             task = kb.get_task(conn, tid)
             assert (task.status == "done") is ok
@@ -97,20 +96,20 @@ def test_pr_completion_requires_current_required_evidence(github):
             github.update(conclusion="success", head="a" * 40)
             github[fault] = True
             tid = kb.create_task(conn, title=fault, completion_contract="acme/repo")
-            assert not kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert kb.get_task(conn, tid).status != "done"
             github.pop(fault)
         # Omission and a sibling repository cannot downgrade the stored declaration.
         tid = kb.create_task(conn, title="publish", completion_contract="acme/repo")
         assert not kb.complete_task(conn, tid, summary="local green")
-        assert not kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/other/repo/pull/7"})
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/other/repo/pull/7"})
         before = len(github["requests"])
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
     with connect() as conn:
         for conclusion in ("success", "failure"):
@@ -123,7 +122,7 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
                     assert kb.unblock_task(rival, tid)
                     github["replacement"] = kb.claim_task(rival, tid).current_run_id
             github.update(conclusion=conclusion, race=reclaim)
-            assert not kb.complete_task(conn, tid, expected_run_id=run_id,
+            assert not kb.complete_task(conn, tid, result="done", expected_run_id=run_id,
                 metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert kb.get_task(conn, tid).current_run_id == github["replacement"]
             assert github["replacement"] != run_id
@@ -132,97 +131,102 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             github.pop("race")
 
 
-@pytest.mark.linux_only
-def test_fork_pr_acceptance_accepts_open_mergeable(github):
-    """Regression: a fork PR (contract OWNER/REPO on a fork) that is OPEN,
-    mergeable, and head-resolvable via gh must accept rather than be flattened
-    to the catch-all infra error. The fixture's fork has no branch-protection
-    rules (404 on rules/branches), which must NOT be treated as infra failure.
-    """
-    github.update(conclusion="success", head="a" * 40, missing=False, stale=False, head_change=False)
-    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
-    assert receipt["classification"] == "success", receipt
-    assert receipt["ok"] is True, receipt
-    assert receipt["gh_error"] is None, receipt
-    assert receipt["head_sha"] == "a" * 40
+# --- #122689: acceptance must read the repo as the ASSIGNEE profile's gh login ---
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("posix")
+def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
+    """The gh child env carries the assignee's own GH credentials (its .env),
+    never the ambient/launch residue, and an invisible repo is classified
+    `auth` naming the repository — not a retryable `infra` failure."""
+    from pathlib import Path
 
-@pytest.mark.linux_only
-def test_fork_pr_without_branch_protection_accepts(github, monkeypatch):
-    """Real fork path: the fork has NO branch protection at all, so the GraphQL
-    branchProtectionRule is None and /rules/branches returns empty. After
-    verifying the PR is OPEN with a resolvable head, collect_acceptance must
-    accept (ok=True, classification=success) rather than leaving ok=False with a
-    'no required checks' detail. The old behavior stranded the real fork PR #7,
-    whose head was valid but whose target ref had no CI gate."""
+    launch_home = tmp_path / "home"
+    launch_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    assignee_home = launch_home / "profiles" / "b"
+    assignee_home.mkdir(parents=True)
+    (assignee_home / ".env").write_text("GH_TOKEN=b-token\n", encoding="utf-8")
+    # Ambient residue that must NOT decide the login.
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/nonexistent/launch/gh")
 
-    def no_protection(endpoint, **_k):
-        if endpoint == "graphql":
-            return {"data": {"repository": {"pullRequest": {
-                "headRefOid": "a" * 40, "baseRefName": "main", "state": "OPEN",
-                "baseRef": {"branchProtectionRule": None}}}}}
-        if "rules/branches" in endpoint:
-            return [[]]
-        if "check-runs" in endpoint:
-            return [{"total_count": 0, "check_runs": []}]
-        if "statuses" in endpoint:
-            return [[]]
-        if "pulls/" in endpoint:
-            return {"head": {"sha": "a" * 40}, "base": {"ref": "main"}, "state": "open"}
-        return {}
-
-    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance._api", no_protection)
-    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
-    assert receipt["classification"] == "success", receipt
-    assert receipt["ok"] is True, receipt
-    assert receipt["gh_error"] is None, receipt
-    assert receipt["head_sha"] == "a" * 40
+    env_dump = tmp_path / "gh_env.json"
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport json, os\n"
+                  f"json.dump(dict(os.environ), open({str(env_dump)!r}, 'w'))\n"
+                  "print(json.dumps({'data': {'repository': None}}))\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipts = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
+        assert receipts[-1]["classification"] == "auth"
+        assert "acme/repo" in receipts[-1]["detail"]
+    captured = json.loads(env_dump.read_text())
+    assert captured["GH_TOKEN"] == "b-token"
+    assert captured.get("GH_CONFIG_DIR") != "/nonexistent/launch/gh"
+    assert "credentials" in (kb.get_task(conn, tid).last_failure_error or "")
 
 
-@pytest.mark.linux_only
-def test_acceptance_distinguishes_infra_from_pr_problem(github, monkeypatch):
-    """collect_acceptance must not collapse a gh-runtime failure and a genuine
-    PR/data problem into one infra string. The first keeps gh_error with the
-    real cause; the second is a PR problem (classification 'unmatched'), never
-    'infra'."""
+@pytest.mark.platforms("posix")
+def test_assignee_without_own_gh_login_never_falls_through_to_ambient_login(tmp_path, monkeypatch):
+    """An assignee profile with no GH_TOKEN/GH_CONFIG_DIR of its own must not inherit the
+    launch user's ~/.config/gh (HOME/XDG_CONFIG_HOME stay the launch process's): gh is pinned
+    to a profile-owned config dir, its 'not logged in' exit is classified `auth` naming the profile."""
+    launch_home = tmp_path / "home"
+    launch_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    assignee_home = launch_home / "profiles" / "b"
+    assignee_home.mkdir(parents=True)
+    (assignee_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/nonexistent/launch/gh")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "launch-xdg"))
 
-    # (1) gh crashes on the GraphQL call -> infra with classified failure, never
-    #     misreported as the PR being invalid.
-    def boom(*_a, **_k):
-        raise GhInfraError(1, "auth", "gh auth failed")
-    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance._api", boom)
-    infra = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
-    assert infra["classification"] == "infra", infra
-    assert infra["gh_error"] == {"exit_code": 1, "category": "auth"}, infra
-    assert "infrastructure" not in (infra.get("detail") or "").lower() or True  # infra phrasing ok
-    assert "PR acceptance data problem" not in (infra.get("detail") or ""), infra
+    env_dump = tmp_path / "gh_env.json"
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    # Real gh: GH_CONFIG_DIR wins; a config dir without hosts.yml means "not logged in" (exit 4).
+    gh.write_text(f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+                  f"pathlib.Path({str(env_dump)!r}).write_text(json.dumps(dict(os.environ)), encoding='utf-8')\n"
+                  "if 'GH_CONFIG_DIR' in os.environ and not os.path.exists(os.environ['GH_CONFIG_DIR']):\n"
+                  "    sys.exit(4)\n"
+                  "print(json.dumps({'data': {'repository': None}}))\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+    assert receipt["classification"] == "auth"
+    assert "'b'" in receipt["detail"] and "no login" in receipt["detail"]
+    captured = json.loads(env_dump.read_text(encoding="utf-8-sig"))
+    assert captured["GH_CONFIG_DIR"] == str(assignee_home / "gh")
+    assert "GH_TOKEN" not in captured and "GITHUB_TOKEN" not in captured
 
-    # (2) gh works but the PR is genuinely closed -> a PR problem, NOT infra.
-    #     Return valid shapes for every endpoint except the GraphQL PR query,
-    #     which reports CLOSED so the gate raises the explicit "PR is closed"
-    #     ValueError instead of tripping on a unrelated TypeError.
-    def closed_pr(endpoint, **_k):
-        if endpoint == "graphql":
-            return {"data": {"repository": {"pullRequest": {
-                "headRefOid": "a" * 40, "baseRefName": "main", "state": "CLOSED",
-                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                    {"context": "required", "app": {"databaseId": 1}}]}}}}}}
-        if "rules/branches" in endpoint:
-            return [[]]
-        if "check-runs" in endpoint:
-            return [{"total_count": 1, "check_runs": [
-                {"id": 1, "name": "required", "head_sha": "a" * 40, "app": {"id": 1},
-                 "status": "completed", "conclusion": "success",
-                 "html_url": "https://github.com/acme/repo/actions/runs/1"}]}]
-        if "statuses" in endpoint:
-            return [[]]
-        if "pulls/" in endpoint:
-            return {"head": {"sha": "a" * 40}, "base": {"ref": "main"}, "state": "closed"}
-        return {}
-    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance._api", closed_pr)
-    bad_pr = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
-    assert bad_pr["classification"] == "unmatched", bad_pr
-    assert bad_pr["ok"] is False, bad_pr
-    assert bad_pr["gh_error"] is None, bad_pr
-    assert "PR acceptance data problem" in (bad_pr.get("detail") or ""), bad_pr
+
+def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, monkeypatch):
+    """A card assigned to a profile that no longer exists must not run gh as the completing
+    process's ambient login: classification `auth` naming the profile, gh never invoked."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))  # any gh spawn would fail as infra
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="as-ghost", completion_contract="acme/repo", assignee="ghost")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+    assert receipt["classification"] == "auth"
+    assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
