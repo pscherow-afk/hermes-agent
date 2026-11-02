@@ -31,7 +31,9 @@ from plugins.memory.holographic.store import MemoryStore
         # empty string → empty output
         ("", ""),
         # FTS5 operator characters stripped
-        ("context: length-probe", {"context", "lengthprobe"}),
+        ("context: length-probe", {"context", "length", "probe"}),
+        # hyphenated compound split into distinct indexed tokens (not glued)
+        ("wb-pipeline deployment", {"wb", "pipeline", "deployment"}),
         # trailing punctuation stripped by tokenizer
         ("hello, world!", {"hello", "world"}),
     ],
@@ -49,9 +51,10 @@ def test_sanitize_fts_query_extracts_content_tokens(query, expected_tokens):
         return
 
     # OR-joined phrase literals: `"tok1" OR "tok2" OR ...`
-    # Extract the tokens between quotes, order-independent.
+    # (longer terms become FTS5 prefix tokens `"tok1*"`; strip the trailing
+    # `*` before comparing against the expected base tokens).
     import re
-    matches = re.findall(r'"([^"]+)"', result)
+    matches = [m.rstrip("*") for m in re.findall(r'"([^"]+)"', result)]
     assert set(matches) == expected_tokens, f"got {result!r}"
 
 
@@ -93,6 +96,61 @@ def test_prefetch_recovers_prose_query(retriever_with_facts):
     assert len(results) >= 1
     # The top hit should be the deployment rollback fact
     assert "deployment rollback" in results[0]["content"].lower()
+
+
+@pytest.fixture
+def retriever_with_recall_facts(tmp_path):
+    """MemoryStore seeded with facts that exercise the hyphen + morphology fix."""
+    db_path = tmp_path / "recall_facts.db"
+    store = MemoryStore(str(db_path))
+    store.add_fact(
+        content="The wb-pipeline sync job exports orders to MoySklad nightly.",
+        category="project",
+    )
+    store.add_fact(
+        content="Wildberries commission changed; recompute комиссия per item.",
+        category="project",
+    )
+    store.add_fact(
+        content="Карточка товара требует актуальных характеристик для SEO.",
+        category="project",
+    )
+    store.add_fact(
+        content="deploy target setting alpha beta gamma option three",
+        category="tool",
+    )
+    retriever = FactRetriever(store=store)
+    yield retriever
+    store.close()
+
+
+def test_hyphen_query_recovers_split_tokens(retriever_with_recall_facts):
+    """`wb-pipeline` must not be glued into the non-indexed token `wbpipeline`.
+
+    The unicode61 tokenizer indexes `wb` and `pipeline` separately, so the
+    sanitizer has to split the hyphen and OR-join both tokens. Before the fix
+    this returned zero hits.
+    """
+    results = retriever_with_recall_facts.search("wb-pipeline sync")
+    assert results, "hyphenated compound returned no candidates"
+    assert any("wb-pipeline" in r["content"].lower() for r in results)
+
+
+def test_russian_prefix_query_recovers_morphology(retriever_with_recall_facts):
+    """A bare stem should match its inflected forms via FTS5 prefix search.
+
+    `комиссия` is stored but the query `комисс` (prefix) must still hit it,
+    recovering morphology without a stemmer. Before the fix only exact tokens
+    matched.
+    """
+    results = retriever_with_recall_facts.search("комисс расчёт")
+    assert any("комиссия" in r["content"].lower() for r in results)
+
+
+def test_russian_prefix_query_recovers_inflected_card(retriever_with_recall_facts):
+    """`карточка` (stored) must be reachable from the stem `карточ`."""
+    results = retriever_with_recall_facts.search("карточ товара")
+    assert any("карточка" in r["content"].lower() for r in results)
 
 
 

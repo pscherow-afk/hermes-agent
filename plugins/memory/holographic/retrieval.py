@@ -16,7 +16,10 @@ from . import holographic as hrr
 _FACT_COLUMNS = "fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, created_at, updated_at"
 _ROLE_ENTITY, _ROLE_CONTENT = hrr.ROLE_ENTITY, hrr.ROLE_CONTENT
 _PUNCT = ".,;:!?\"'()[]{}#@<>"
-_FTS_OPERATORS = str.maketrans("", "", '"()*^:-+')
+# Hyphen is intentionally NOT stripped here: it is split into a space by the
+# sanitizer/tokenizer so that `wb-pipeline` indexes (and queries) as the two
+# distinct tokens `wb` and `pipeline` that unicode61 actually produces.
+_FTS_OPERATORS = str.maketrans("", "", '"()*^:+')
 # Stopwords dropped before FTS5 OR-expansion: short English function words that
 # carry no retrieval signal and force false-negative AND matches.
 _FTS_STOPWORDS = frozenset("""
@@ -184,18 +187,37 @@ class FactRetriever:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Lowercase whitespace tokens with surrounding punctuation stripped (no stemming)."""
-        return {c for c in (w.strip(_PUNCT) for w in text.lower().split()) if c} if text else set()
+        """Lowercase whitespace tokens with surrounding punctuation stripped (no stemming).
+
+        Hyphens are split into separate tokens to match the FTS5 unicode61 tokenizer,
+        which also separates ``wb-pipeline`` into ``wb`` and ``pipeline``."""
+        if not text:
+            return set()
+        return {c for c in (w.strip(_PUNCT) for w in text.lower().replace("-", " ").split()) if c}
 
     @staticmethod
     def _sanitize_fts_query(query: str) -> str:
-        """Natural-language query -> FTS5-safe OR expression of quoted tokens. FTS5 AND-joins a multi-word
-        MATCH by default, which tanks recall on prose: drop stopwords and <2-char tokens, strip FTS5 operator
-        chars, phrase-quote each survivor. If nothing survives, return the raw query (zero results, not a SQL error)."""
+        """Natural-language query -> FTS5-safe OR expression of phrase/prefix tokens.
+
+        FTS5 AND-joins a multi-word MATCH by default, which tanks recall on prose:
+        drop stopwords and <2-char tokens, strip FTS5 operator chars, and OR-join the
+        survivors. Hyphens are split into separate tokens (``wb-pipeline`` -> ``wb pipeline``)
+        because the default unicode61 tokenizer indexes ``wb`` and ``pipeline`` as distinct
+        tokens, so gluing them as ``wbpipeline`` yields zero hits. Terms with >=4 characters
+        become FTS5 prefix tokens (``term*``) to recover morphological variants
+        (``комиссия`` -> ``комиссия*`` matches комиссия/комиссии/комиссию) without a stemmer.
+        If nothing survives, return the raw query (zero results, not a SQL error)."""
         if not query:
             return ""
-        tokens = [f'"{c}"' for c in (raw.strip(_PUNCT).translate(_FTS_OPERATORS) for raw in query.lower().split())
-                  if len(c) >= 2 and c not in _FTS_STOPWORDS]
+        query = query.replace("-", " ")  # split hyphenated compounds into real indexed tokens
+        tokens = []
+        for raw in query.lower().split():
+            c = raw.strip(_PUNCT).translate(_FTS_OPERATORS)
+            if len(c) < 2 or c in _FTS_STOPWORDS:
+                continue
+            # prefix search for longer terms recovers morphology without a stemmer;
+            # FTS5 prefix syntax is `"term"*` (the `*` sits OUTSIDE the quotes)
+            tokens.append(f'"{c}"*' if len(c) >= 4 else f'"{c}"')
         return " OR ".join(tokens) if tokens else query
 
     @staticmethod
