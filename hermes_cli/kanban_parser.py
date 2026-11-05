@@ -217,6 +217,29 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        # Optional completion/block notification subscription — mirrors the
+        # kanban_create tool's auto-subscribe so command-created cards no longer
+        # finish silently. Omit all of these to preserve prior (no-subscription) behaviour.
+        _arg("--platform",
+             help="Subscribe this gateway source to the new task's terminal events "
+                  "(completion/block) so the operator is notified in-chat. Required together "
+                  "with --chat-id. Omit (with --chat-id) to create the task without a subscription."),
+        _arg("--chat-id",
+             help="Chat id for --platform (e.g. a Telegram chat id). Required with --platform."),
+        _arg("--thread-id",
+             help="Thread id within --chat-id for threaded sources."),
+        _arg("--user-id",
+             help="Source user id, replayed on active wake so the notifier reaches the right session."),
+        _arg("--chat-type", choices=("dm", "group", "channel", "thread"),
+             help="Originating source chat_type (default: dm for new subscriptions)."),
+        _arg("--notifier-profile",
+             help="Profile gateway that owns/delivers the subscription "
+                  "(default: active HERMES_PROFILE, mirroring the kanban_create tool)."),
+        _arg("--delivery-mode", choices=kbn._NOTIFY_DELIVERY_MODES,
+             help="How the notifier reacts to terminal events: 'notify' (message), "
+                  "'notify+wake' (message + wake the destination agent), or 'wake' (wake only)."),
+        _arg("--subscribe-telegram", metavar="CHAT_ID", dest="subscribe_telegram",
+             help="Convenience shorthand for '--platform telegram --chat-id CHAT_ID'."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [

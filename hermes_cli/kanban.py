@@ -332,6 +332,37 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_create_subscribe(args: argparse.Namespace):
+    """Resolve ``kanban create``'s optional --subscribe-* flags into
+    ``kanban_db_notify.add_notify_sub`` kwargs, or return an error string.
+
+    Returns ``(target, None)`` to subscribe, ``(None, None)`` to skip (back-compat
+    default — no subscription), or ``(None, error)`` to refuse the invocation.
+    ``notifier_profile`` falls back to the active profile (``HERMES_PROFILE``),
+    mirroring the ``kanban_create`` tool's resolution.
+    """
+    platform = getattr(args, "platform", None)
+    chat_id = getattr(args, "chat_id", None)
+    subscribe_tg = getattr(args, "subscribe_telegram", None)
+    if subscribe_tg is not None and (platform or chat_id):
+        return None, "kanban: --subscribe-telegram is mutually exclusive with --platform/--chat-id"
+    if subscribe_tg is not None:
+        platform, chat_id = "telegram", subscribe_tg
+    if not platform and not chat_id:
+        return None, None
+    if bool(platform) != bool(chat_id):
+        return None, "kanban: --platform and --chat-id must be supplied together"
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": getattr(args, "thread_id", None),
+        "user_id": getattr(args, "user_id", None),
+        "chat_type": getattr(args, "chat_type", None),
+        "notifier_profile": getattr(args, "notifier_profile", None) or _profile_author(),
+        "delivery_mode": getattr(args, "delivery_mode", None),
+    }, None
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -344,6 +375,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8-sig")
         except OSError as exc:
             return _err(f"kanban: --body-file: {exc}", 2)
+
+    sub_target, sub_err = _resolve_create_subscribe(args)
+    if sub_err:
+        return _err(sub_err, 2)
 
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -379,10 +414,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        if sub_target is not None:
+            kbn.add_notify_sub(
+                conn, task_id=task_id,
+                platform=sub_target["platform"], chat_id=sub_target["chat_id"],
+                chat_type=sub_target["chat_type"], thread_id=sub_target["thread_id"],
+                user_id=sub_target["user_id"],
+                notifier_profile=sub_target["notifier_profile"],
+                delivery_mode=sub_target["delivery_mode"],
+            )
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if sub_target is not None:
+            print(f"Subscribed {sub_target['platform']}:{sub_target['chat_id']} "
+                  f"(notifier={sub_target['notifier_profile']}) to {task_id}")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:
