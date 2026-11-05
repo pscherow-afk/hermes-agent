@@ -106,6 +106,50 @@ def test_default_repeated_identical_failed_call_warns_without_blocking():
     assert controller.halt_decision is None
 
 
+def test_kanban_complete_empty_call_loop_gets_directive_then_loop_halt():
+    """t_5c451765: a worker replaying kanban_complete({}) must get an actionable
+    directive at N=3 and the run must stop (tool_loop) at N+2=5, instead of
+    burning the whole budget on identical failures."""
+    controller = ToolCallGuardrailController()
+    args = {"board": "default"}  # empty call: no summary/result/metadata
+    result = '{"error":"provide at least one of: summary (preferred), result"}'
+
+    decisions = []
+    for _ in range(5):
+        assert controller.before_call("kanban_complete", args).action == "allow"
+        decisions.append(controller.after_call("kanban_complete", args, result, failed=True))
+
+    # 1st call: below the warn threshold, no escalation.
+    assert decisions[0].action == "allow"
+    # 2nd call: plain repeated-failure warning (existing behaviour).
+    assert decisions[1].code == "repeated_exact_failure_warning"
+    # 3rd & 4th: actionable directive naming the missing `summary`.
+    assert decisions[2].code == "repeated_exact_failure_directive"
+    assert decisions[2].action == "warn"
+    assert "summary" in decisions[2].message
+    assert decisions[3].code == "repeated_exact_failure_directive"
+    # 5th (N+2): hard stop so the run ends with a tool_loop outcome, not more steps.
+    assert decisions[4].action == "halt"
+    assert decisions[4].code == "repeated_exact_failure_loop"
+    assert controller.halt_decision is not None
+
+
+def test_other_tools_not_caught_by_kanban_directive():
+    """Regression: the empty-call escalation is specific to kanban_complete; a
+    generic tool's identical-failure loop still only warns (no directive/halt)."""
+    controller = ToolCallGuardrailController()
+    args = {"query": "same"}
+    result = '{"error":"boom"}'
+
+    decisions = []
+    for _ in range(5):
+        assert controller.before_call("web_search", args).action == "allow"
+        decisions.append(controller.after_call("web_search", args, result, failed=True))
+
+    assert all(d.code == "repeated_exact_failure_warning" for d in decisions[1:])
+    assert controller.halt_decision is None
+
+
 def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(

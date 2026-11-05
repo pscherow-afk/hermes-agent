@@ -183,7 +183,11 @@ def run_tool_round(
 
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
-        _turn_exit_reason = "guardrail_halt"
+        # An identical-failure completion loop ends the run with an explicit
+        # `tool_loop` outcome rather than the generic guardrail halt (t_5c451765).
+        _turn_exit_reason = (
+            "tool_loop" if decision.code in (
+                "repeated_exact_failure_loop", "repeated_exact_failure_block") else "guardrail_halt")
         final_response = agent._toolguard_controlled_halt_response(decision)
         agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
         append_message(messages, {"role": "assistant", "content": final_response})

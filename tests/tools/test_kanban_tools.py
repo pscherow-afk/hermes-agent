@@ -195,6 +195,43 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_empty_summary_with_metadata_generates_summary(worker_env):
+    """t_5c451765: empty summary/result but a non-empty metadata must still close
+    the card, synthesizing a summary from metadata and stamping
+    ``closed_with_generated_summary`` so real work is never lost to a call-shape error."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    out = kt._handle_complete({
+        "metadata": {"changed_files": ["a.py", "b.py"], "tests_run": 46},
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d["task_id"] == worker_env
+
+    conn = kbc.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.outcome == "completed"
+        assert "generated summary from metadata" in (run.summary or "")
+        assert run.metadata.get("closed_with_generated_summary") is True
+        assert run.metadata.get("changed_files") == ["a.py", "b.py"]
+        assert run.metadata.get("tests_run") == 46
+    finally:
+        conn.close()
+
+
+def test_complete_empty_summary_and_empty_metadata_rejected(worker_env):
+    """t_5c451765: a call with no summary, result, or meaningful metadata is still
+    rejected — the schema-level requirement is enforced at call time too."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"metadata": {}})
+    d = json.loads(out)
+    assert d.get("error")
+    assert "summary" in d["error"] or "metadata" in d["error"]
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

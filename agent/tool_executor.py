@@ -739,6 +739,10 @@ def _dispatch_authorized_once(
     if block_body is not None or guardrail_decision is not None:
         _advance_start_order()
         state.blocked = True
+        # A guardrail halt (e.g. the kanban_complete empty-call loop at N+2,
+        # t_5c451765) must stop the run even though the call was refused pre-execution.
+        if guardrail_decision is not None and guardrail_decision.should_halt:
+            agent._set_tool_guardrail_halt(guardrail_decision)
         return _blocked_tool_result(
             agent, ref,
             block_body=block_body, block_error_type=block_error_type, guardrail_decision=guardrail_decision,

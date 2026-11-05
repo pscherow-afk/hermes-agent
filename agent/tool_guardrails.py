@@ -70,6 +70,7 @@ _BOOL_FIELDS = ("warnings_enabled", "hard_stop_enabled", "non_interactive_hard_s
 # Threshold field -> (nested section, nested key). The flat legacy key is the field name itself.
 _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
     "exact_failure_warn_after": ("warn_after", "exact_failure"),
+    "exact_failure_directive_after": ("warn_after", "exact_failure_directive"),
     "same_tool_failure_warn_after": ("warn_after", "same_tool_failure"),
     "no_progress_warn_after": ("warn_after", "idempotent_no_progress"),
     "exact_failure_block_after": ("hard_stop_after", "exact_failure"),
@@ -123,6 +124,7 @@ class ToolCallGuardrailConfig:
     hard_stop_enabled: bool = False
     non_interactive_hard_stop_enabled: bool = True
     exact_failure_warn_after: int = 2
+    exact_failure_directive_after: int = 3
     exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
     same_tool_failure_halt_after: int = 8
@@ -402,6 +404,18 @@ class ToolCallGuardrailController:
                 exact_count = self._exact_failure_counts[signature] = exact_count + 1
             same_count = self._same_tool_failure_counts[tool_name] = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._no_progress.pop(signature, None)
+            # Targeted guard for the empty-call completion loop (t_5c451765): a model
+            # replaying `kanban_complete({})` must get an actionable directive, then the
+            # run stops with a tool_loop outcome instead of burning the budget. N+2 == 5.
+            if tool_name == "kanban_complete":
+                if exact_count >= self.config.exact_failure_block_after:
+                    return self._decide(
+                        "halt", "repeated_exact_failure_loop", tool_name, exact_count, signature,
+                        message=_exact_failure_loop_message(tool_name, exact_count))
+                if exact_count >= self.config.exact_failure_directive_after:
+                    return self._decide(
+                        "warn", "repeated_exact_failure_directive", tool_name, exact_count, signature,
+                        message=_exact_failure_directive_message(tool_name, exact_count))
             # same_tool_failure counts DIFFERENT args on one tool; for failure-tolerant
             # tools a run of distinct red commands is diagnosis, not a loop — warn, never halt.
             if (
@@ -584,6 +598,23 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
         return result
     label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
     return (result or "") + f"\n\n[{label}: {decision.code}; count={decision.count}; {decision.message}]"
+
+
+def _exact_failure_directive_message(tool_name: str, count: int) -> str:
+    """Actionable nudge after N identical kanban_complete failures: pass a summary."""
+    return (
+        f"kanban_complete has failed {count} times with identical (empty) arguments. "
+        f"Stop retrying it unchanged. Call kanban_complete again WITH a non-empty "
+        f"`summary` string describing what you did (or pass a non-empty `metadata` "
+        f"dict); an empty call is rejected and loops.")
+
+
+def _exact_failure_loop_message(tool_name: str, count: int) -> str:
+    """Hard-stop message when the empty-call completion loop hits N+2."""
+    return (
+        f"kanban_complete failed {count} times with identical (empty) arguments. The "
+        f"run is being stopped: call kanban_complete WITH a non-empty `summary` (or "
+        f"non-empty `metadata`) to close the task; an empty call only loops.")
 
 
 def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:

@@ -93,7 +93,8 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
+        "``summary``, ``result``, or a non-empty ``metadata`` is REQUIRED "
+        "— a call with none of them is rejected before completion. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
@@ -163,6 +164,15 @@ KANBAN_COMPLETE_SCHEMA = _schema(
     },
     [],
 )
+
+# Schema-level requirement (regression for t_5c451765): at least one of
+# summary / result / metadata must be present. Expressed as `anyOf` so the
+# model sees it in the tool description instead of only from a runtime error.
+KANBAN_COMPLETE_SCHEMA["parameters"]["anyOf"] = [
+    {"required": ["summary"]},
+    {"required": ["result"]},
+    {"required": ["metadata"]},
+]
 
 KANBAN_BLOCK_SCHEMA = _schema(
     "kanban_block",

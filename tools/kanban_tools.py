@@ -395,6 +395,43 @@ def _merge_artifacts(metadata: Any, artifacts: list[str]) -> dict:
     return metadata
 
 
+def _generate_summary_from_metadata(metadata: Any) -> str | None:
+    """Build a handoff summary from a non-empty ``metadata`` dict.
+
+    A worker that did the work but called kanban_complete with an empty
+    ``summary``/``result`` (and only a populated ``metadata``) should not lose
+    its completion to a call-shape error. Synthesize a short summary from the
+    meaningful fields so the card still closes (regression for t_5c451765).
+    Returns None when there is nothing worth surfacing.
+    """
+    if not isinstance(metadata, dict) or not metadata:
+        return None
+    parts: list[str] = []
+    changed = metadata.get("changed_files")
+    if isinstance(changed, (list, tuple)) and changed:
+        parts.append(f"changed_files={list(changed)}")
+    tests = metadata.get("tests_run")
+    if isinstance(tests, int) and tests:
+        parts.append(f"tests_run={tests}")
+    findings = metadata.get("findings")
+    if isinstance(findings, (list, tuple)) and findings:
+        parts.append(f"findings={len(findings)} items")
+    decisions = metadata.get("decisions")
+    if isinstance(decisions, (list, tuple)) and decisions:
+        parts.append(f"decisions={len(decisions)} items")
+    if not parts:
+        # Any other non-trivial top-level value still counts as a handoff.
+        nontrivial = {
+            k: v for k, v in metadata.items()
+            if k != "closed_with_generated_summary" and v not in (None, "", [], {}, 0)
+        }
+        if not nontrivial:
+            return None
+        preview = json.dumps(nontrivial, ensure_ascii=False)
+        parts.append("metadata=" + preview[:200])
+    return "Closed via generated summary from metadata: " + "; ".join(parts)
+
+
 def _require_text(args: dict, name: str, message: Optional[str] = None) -> Any:
     """``args[name]``; rejects when missing or blank."""
     value = args.get(name)
@@ -737,7 +774,17 @@ def _handle_complete(args: dict, **kw) -> str:
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
-    _check(summary or result, "provide at least one of: summary (preferred), result")
+    # Schema-level requirement: at least one of summary / result / metadata.
+    # A non-empty metadata alone still closes the card via a generated summary,
+    # so real work is never lost to a call-shape error (regression t_5c451765).
+    if not (summary or result):
+        generated = _generate_summary_from_metadata(metadata)
+        if generated:
+            summary = generated
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata["closed_with_generated_summary"] = True
+        else:
+            _check(False, "provide at least one of: summary (preferred), result, or a non-empty metadata dict")
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
