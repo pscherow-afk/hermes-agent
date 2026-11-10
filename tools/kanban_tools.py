@@ -123,12 +123,10 @@ class _CircuitBreaker:
                 )
                 return None
 
-            # Cooldown expired — reset and allow.
+            # Cooldown elapsed — drop the entry so the next call starts fresh
+            # and the state dict doesn't grow without bound.
             if (now - entry.last_time) >= _CIRCUIT_BREAKER_COOLDOWN_SECONDS:
-                entry.attempt_count = 1
-                entry.last_error = None
-                entry.last_error_signature = None
-                entry.last_time = now
+                del self._state[key]
                 return None
 
             # Same call within cooldown — check retry limit.
@@ -176,8 +174,17 @@ class _CircuitBreaker:
                 return
             entry.last_time = now
             if is_error:
+                new_sig = result[:80]
+                if (
+                    entry.last_error_signature is not None
+                    and entry.last_error_signature != new_sig
+                ):
+                    # A different failure reason is a changed retry condition,
+                    # not a repeat of the same bug — reset the attempt counter
+                    # so a genuinely new approach isn't blocked for the old one.
+                    entry.attempt_count = 1
                 entry.last_error = result
-                entry.last_error_signature = result[:80]
+                entry.last_error_signature = new_sig
             else:
                 # Success — reset the breaker for this key so the next
                 # identical call starts fresh.
@@ -668,117 +675,6 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # Handlers
 # ---------------------------------------------------------------------------
 
-# Circuit breaker helpers for kanban_show — exposed for testability.
-# The tests call these directly; _handle_show uses the generic
-# _circuit_breaker internally.
-
-_SHOW_BREAKER_KEY = "kanban_show"
-
-
-def _show_sanitized_input_hash(tid: str, board: Optional[str]) -> str:
-    """Deterministic 16-char input hash for the breaker, keyed by
-    (task_id, board)."""
-    stable = json.dumps(
-        {"task_id": tid, "board": board},
-        sort_keys=True, ensure_ascii=False, default=str,
-    )
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
-
-
-def _show_error_signature(exc: Exception) -> str:
-    """Format an exception into ``TypeName: first line of message``."""
-    name = type(exc).__qualname__
-    msg = str(exc).split("\n")[0] if str(exc) else ""
-    return f"{name}: {msg}" if msg else name
-
-
-def _show_breaker_reset(tid: str) -> None:
-    """Clear all circuit breaker state for a task."""
-    # Clear any entry whose input hash starts with this task_id.
-    # The generic breaker stores keys as (tool_name, input_hash).
-    # We clear by walking the state and removing matching entries.
-    with _circuit_breaker._lock:
-        keys_to_remove = [
-            k for k in _circuit_breaker._state
-            if k[0] == _SHOW_BREAKER_KEY and k[1].startswith(
-                _show_sanitized_input_hash(tid, None)[:8]
-            )
-        ]
-        for k in keys_to_remove:
-            del _circuit_breaker._state[k]
-
-
-def _show_breaker_record_failure(
-    tid: str, input_hash: str, error_signature: str
-) -> None:
-    """Record a failure for the breaker. Creates or increments.
-
-    A *different* error signature than the last recorded one resets the
-    attempt count — a distinct failure reason is a changed retry
-    condition, not a repeat of the same bug.
-    """
-    key = (_SHOW_BREAKER_KEY, input_hash)
-    now = time.monotonic()
-    with _circuit_breaker._lock:
-        entry = _circuit_breaker._state.get(key)
-        if entry is None:
-            _circuit_breaker._state[key] = _CircuitBreakerEntry(
-                input_hash=input_hash,
-                attempt_count=1,
-                last_error=error_signature,
-                last_error_signature=error_signature,
-                last_time=now,
-            )
-        elif (
-            entry.last_error_signature is not None
-            and entry.last_error_signature != error_signature
-        ):
-            # Different error reason — reset the count.
-            entry.attempt_count = 1
-            entry.last_error = error_signature
-            entry.last_error_signature = error_signature
-            entry.last_time = now
-        else:
-            entry.attempt_count += 1
-            entry.last_error = error_signature
-            entry.last_error_signature = error_signature
-            entry.last_time = now
-
-
-def _show_breaker_blocks(tid: str, input_hash: str) -> Optional[str]:
-    """Return a tool-error string when the breaker blocks, or None."""
-    key = (_SHOW_BREAKER_KEY, input_hash)
-    now = time.monotonic()
-    with _circuit_breaker._lock:
-        entry = _circuit_breaker._state.get(key)
-        if entry is None:
-            return None
-        if (now - entry.last_time) >= _CIRCUIT_BREAKER_COOLDOWN_SECONDS:
-            return None
-        if entry.attempt_count > _CIRCUIT_BREAKER_MAX_IDENTICAL:
-            telemetry = json.dumps({
-                "tool_name": _SHOW_BREAKER_KEY,
-                "input_hash": input_hash,
-                "error_signature": entry.last_error_signature,
-                "retry_reason": "max_identical_retries_exceeded",
-                "attempt_number": entry.attempt_count,
-            }, ensure_ascii=False)
-            return (
-                f"circuit breaker tripped for {_SHOW_BREAKER_KEY}: "
-                f"identical call with the same input was attempted "
-                f"{entry.attempt_count} times and failed every time. "
-                f"status=TOOL_FAILURE_REQUIRES_INTERVENTION. "
-                f"DO NOT retry this call with the same arguments. "
-                f"Change your approach or check the previous error. "
-                f"Telemetry: {telemetry}"
-            )
-        return None
-
-
-def _show_breaker_record_success(tid: str) -> None:
-    """Record a success — clear all breaker state for the task."""
-    _show_breaker_reset(tid)
-
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events.
@@ -786,18 +682,21 @@ def _handle_show(args: dict, **kw) -> str:
     Protected by a circuit breaker that limits identical retries to 1
     to prevent infinite retry loops on consistent failures.
     """
-    # Circuit breaker check — prevent infinite retry loops on identical
-    # failing calls (P1-A1, t_b38403ea).
-    cb_block = _circuit_breaker.check("kanban_show", args)
+    # Resolve the task id first, then key the breaker on the normalized input
+    # (task_id + board) so calls without an explicit task_id are still
+    # distinguished by the resolved HERMES_KANBAN_TASK value (P1-A1,
+    # t_b38403ea / t_726c8b82).
+    tid = _default_task_id(args.get("task_id"))
+    cb_input = {"task_id": tid, "board": args.get("board")}
+    cb_block = _circuit_breaker.check("kanban_show", cb_input)
     if cb_block is not None:
         return cb_block
 
-    tid = _default_task_id(args.get("task_id"))
     if not tid:
         result = tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
-        _circuit_breaker.record_result("kanban_show", args, result)
+        _circuit_breaker.record_result("kanban_show", cb_input, result)
         return result
     board = args.get("board")
     try:
@@ -806,7 +705,7 @@ def _handle_show(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             if task is None:
                 result = tool_error(f"task {tid} not found")
-                _circuit_breaker.record_result("kanban_show", args, result)
+                _circuit_breaker.record_result("kanban_show", cb_input, result)
                 return result
             comments = kb.list_comments(conn, tid)
             events = kb.list_events(conn, tid)
@@ -860,19 +759,19 @@ def _handle_show(args: dict, **kw) -> str:
                 # dispatcher at spawn time.
                 "worker_context": kb.build_worker_context(conn, tid),
             })
-            _circuit_breaker.record_result("kanban_show", args, result)
+            _circuit_breaker.record_result("kanban_show", cb_input, result)
             return result
         finally:
             conn.close()
     except ValueError as e:
         # Invalid board slug surfaces as ValueError from _normalize_board_slug.
         result = tool_error(f"kanban_show: {e}")
-        _circuit_breaker.record_result("kanban_show", args, result)
+        _circuit_breaker.record_result("kanban_show", cb_input, result)
         return result
     except Exception as e:
         logger.exception("kanban_show failed")
         result = tool_error(f"kanban_show: {e}")
-        _circuit_breaker.record_result("kanban_show", args, result)
+        _circuit_breaker.record_result("kanban_show", cb_input, result)
         return result
 
 
