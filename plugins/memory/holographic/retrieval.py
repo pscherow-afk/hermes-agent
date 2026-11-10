@@ -613,11 +613,15 @@ class FactRetriever:
         if not query:
             return ""
         # Strip FTS5 operator characters from EACH token to avoid
-        # accidentally creating a malformed query.
-        _FTS_SPECIAL = '"()*^:-+'
+        # accidentally creating a malformed query. The hyphen is NOT an
+        # operator here: FTS5 tokenizes "wb-pipeline" into "wb" + "pipeline",
+        # so a hyphen must become a space (splitting the token) — deleting it
+        # would fuse the parts into "wbpipeline", a token that never exists in
+        # the index and silently dropped every hyphenated-name query.
+        _FTS_SPECIAL = '"()*^:+'  # '-' deliberately excluded (replaced by space below)
         tokens: list[str] = []
         for raw in query.lower().split():
-            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .translate(
+            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .replace("-", " ").translate(
                 str.maketrans("", "", _FTS_SPECIAL)
             )
             if len(cleaned) < 2:
