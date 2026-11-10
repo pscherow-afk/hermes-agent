@@ -80,6 +80,199 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Circuit breaker: kanban_show retry-loop protection
+# These exercise the real breaker via the public surface (_circuit_breaker /
+# _handle_show) — no parallel helper layer.
+# ---------------------------------------------------------------------------
+
+
+def _show_cb_reset(tid, board=None):
+    from tools import kanban_tools as kt
+    kt._circuit_breaker.reset("kanban_show", {"task_id": tid, "board": board})
+
+
+def test_show_breaker_allows_first_identical_retry(worker_env):
+    """First identical retry is tolerated (transient error recovery);
+    the breaker only trips on the third identical failing call."""
+    from tools import kanban_tools as kt
+    cb = kt._circuit_breaker
+    key = {"task_id": worker_env, "board": None}
+    _show_cb_reset(worker_env)
+    try:
+        # 1st failing call — allowed, recorded.
+        assert cb.check("kanban_show", key) is None
+        cb.record_result("kanban_show", key, kt.tool_error("boom A"))
+        # 2nd identical failing call — still allowed.
+        assert cb.check("kanban_show", key) is None
+        cb.record_result("kanban_show", key, kt.tool_error("boom A"))
+        # 3rd identical call — breaker trips.
+        block = cb.check("kanban_show", key)
+        assert block is not None
+        assert "circuit breaker tripped" in block
+        assert "TOOL_FAILURE_REQUIRES_INTERVENTION" in block
+    finally:
+        _show_cb_reset(worker_env)
+
+
+def test_show_breaker_resets_on_success(worker_env):
+    """A successful call resets the breaker for that task."""
+    from tools import kanban_tools as kt
+    cb = kt._circuit_breaker
+    key = {"task_id": worker_env, "board": None}
+    _show_cb_reset(worker_env)
+    try:
+        assert cb.check("kanban_show", key) is None
+        cb.record_result("kanban_show", key, kt.tool_error("boom A"))
+        # A success (valid, non-error result) clears the breaker.
+        cb.record_result("kanban_show", key, json.dumps({"ok": True}))
+        assert cb.check("kanban_show", key) is None
+    finally:
+        _show_cb_reset(worker_env)
+
+
+def test_show_breaker_resets_on_changed_input(worker_env):
+    """A different board value is a different input -> separate breaker."""
+    from tools import kanban_tools as kt
+    cb = kt._circuit_breaker
+    a = {"task_id": worker_env, "board": "board-a"}
+    b = {"task_id": worker_env, "board": "board-b"}
+    _show_cb_reset(worker_env, "board-a")
+    _show_cb_reset(worker_env, "board-b")
+    try:
+        # Fail with board-a twice -> trips on 3rd.
+        assert cb.check("kanban_show", a) is None
+        cb.record_result("kanban_show", a, kt.tool_error("boom"))
+        assert cb.check("kanban_show", a) is None
+        cb.record_result("kanban_show", a, kt.tool_error("boom"))
+        assert cb.check("kanban_show", a) is not None
+        # board-b is a distinct input -> never blocked by a's failures.
+        assert cb.check("kanban_show", b) is None
+    finally:
+        _show_cb_reset(worker_env, "board-a")
+        _show_cb_reset(worker_env, "board-b")
+
+
+def test_show_breaker_resets_on_different_error(worker_env):
+    """A different error signature resets the breaker (new retry reason)."""
+    from tools import kanban_tools as kt
+    cb = kt._circuit_breaker
+    key = {"task_id": worker_env, "board": None}
+    _show_cb_reset(worker_env)
+    try:
+        assert cb.check("kanban_show", key) is None
+        cb.record_result("kanban_show", key, kt.tool_error("TypeError: A"))
+        assert cb.check("kanban_show", key) is None
+        cb.record_result("kanban_show", key, kt.tool_error("TypeError: A"))
+        # Two identical failures -> trips.
+        assert cb.check("kanban_show", key) is not None
+        # A genuinely different error resets the attempt counter.
+        cb.record_result("kanban_show", key, kt.tool_error("ValueError: B"))
+        assert cb.check("kanban_show", key) is None
+    finally:
+        _show_cb_reset(worker_env)
+
+
+def test_show_breaker_happy_path_not_blocked(worker_env):
+    """Five successful calls in a row never trigger the breaker."""
+    from tools import kanban_tools as kt
+    _show_cb_reset(worker_env)
+    try:
+        for _ in range(5):
+            out = kt._handle_show({})
+            d = json.loads(out)
+            assert "task" in d
+            assert d["task"]["id"] == worker_env
+    finally:
+        _show_cb_reset(worker_env)
+
+
+def test_show_breaker_records_error_signature(worker_env):
+    """A failing call stores its error signature in the breaker entry."""
+    from tools import kanban_tools as kt
+    cb = kt._circuit_breaker
+    key = {"task_id": worker_env, "board": None}
+    _show_cb_reset(worker_env)
+    try:
+        cb.check("kanban_show", key)
+        cb.record_result("kanban_show", key, kt.tool_error("boom detail"))
+        with cb._lock:
+            entry = cb._state[("kanban_show", cb._input_hash(key))]
+        assert entry.last_error_signature is not None
+        assert "boom detail" in entry.last_error_signature
+    finally:
+        _show_cb_reset(worker_env)
+
+
+def test_show_breaker_input_hash_uses_board(worker_env):
+    """Different board values produce different breaker input hashes."""
+    from tools import kanban_tools as kt
+    h1 = kt._circuit_breaker._input_hash({"task_id": worker_env, "board": None})
+    h2 = kt._circuit_breaker._input_hash(
+        {"task_id": worker_env, "board": "board-x"}
+    )
+    assert h1 != h2
+    assert len(h1) == 16
+    assert len(h2) == 16
+
+
+def test_show_breaker_loops_then_trips(worker_env, monkeypatch):
+    """Four calls with a non-existent task_id: 1st & 2nd are normal errors,
+    the breaker trips from the 3rd."""
+    from tools import kanban_tools as kt
+    cb = kt._circuit_breaker
+    fake = "t_does_not_exist_000"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", fake)
+    key = {"task_id": fake, "board": None}
+    cb.reset("kanban_show", key)
+    try:
+        for i in range(4):
+            out = kt._handle_show({})
+            if i < 2:
+                assert "circuit breaker tripped" not in out
+                assert "error" in json.loads(out)
+            else:
+                assert "circuit breaker tripped" in out
+    finally:
+        cb.reset("kanban_show", key)
+
+
+def test_show_breaker_isolates_tasks_without_explicit_id(worker_env, monkeypatch):
+    """Two calls without an explicit task_id (id taken from
+    HERMES_KANBAN_TASK) for different tasks must not share breaker state."""
+    from tools import kanban_tools as kt
+    cb = kt._circuit_breaker
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_aaa")
+    a = {"task_id": "t_aaa", "board": None}
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bbb")
+    b = {"task_id": "t_bbb", "board": None}
+    cb.reset("kanban_show", a)
+    cb.reset("kanban_show", b)
+    try:
+        # Both fail (task not found) but keep their own independent state.
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_aaa")
+        out1 = kt._handle_show({})
+        assert "error" in json.loads(out1)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bbb")
+        out2 = kt._handle_show({})
+        assert "error" in json.loads(out2)
+        # A third identical failing call for t_aaa trips its own breaker;
+        # t_bbb remains independent and still allowed.
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_aaa")
+        out3 = kt._handle_show({})  # 2nd identical failure for aaa -> allowed
+        assert "error" in json.loads(out3)
+        out4 = kt._handle_show({})  # 3rd identical failure -> tripped
+        assert "circuit breaker tripped" in out4
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bbb")
+        out5 = kt._handle_show({})
+        assert "circuit breaker tripped" not in out5
+    finally:
+        cb.reset("kanban_show", a)
+        cb.reset("kanban_show", b)
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
