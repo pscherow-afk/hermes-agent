@@ -1,4 +1,4 @@
-"""Cron delivery: target resolution (origin/home/explicit/bot-chat), transcript mirroring and
+"""Cron delivery: target resolution (origin/home/explicit/bot-chat/room), transcript mirroring and
 session seeding, live-adapter / relay / standalone send lanes, and ``_deliver_result``.
 
 Split out of ``cron.scheduler``. Import names from this module directly (``cron.scheduler`` only
@@ -602,6 +602,9 @@ def _resolve_single_delivery_target(
     origin = _resolve_origin(job)
     if deliver_value == "local":
         return None
+    room_address = parse_room_deliver_token(deliver_value)
+    if room_address is not None:
+        return resolve_room_target(job, room_address)
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
     bot_chat_profile = parse_bot_chat_deliver_token(deliver_value)
     if bot_chat_profile is not None:
@@ -909,76 +912,6 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
-# Audio routing is centralized in gateway.platforms.base.should_send_media_as_audio().
-_VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
-_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
-
-
-def _send_media_via_adapter(
-    adapter, chat_id: str, media_files: list, metadata: dict | None, loop, job: dict, platform=None,
-) -> list:
-    """Send MEDIA files as native attachments (routed by extension, as in
-    _process_message_background). Returns per-file error strings so a dropped attachment surfaces
-    in run status, not just the gateway log."""
-    from gateway.platforms.base import (
-        BasePlatformAdapter, should_send_media_as_audio, validate_media_delivery_path)
-    from agent.async_utils import safe_schedule_threadsafe
-    job_ref = {"id": job.get("id", "?")}
-    errors: list = []
-    requested = [(str(p), v) for p, v in (media_files or [])]
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    # Report paths the safety filter dropped (missing file, denied prefix, strict-mode miss).
-    kept = {p for p, _ in media_files}
-    for raw_path, _v in requested:
-        try:
-            dropped = validate_media_delivery_path(raw_path) not in kept
-        except Exception:
-            dropped = True
-        if dropped:
-            errors.append(f"attachment dropped by media path policy: {raw_path}")
-
-    route_platform = platform if platform is not None else getattr(adapter, "platform", None)
-    for media_path, _is_voice in media_files:
-        try:
-            ext = _sched.Path(media_path).suffix.lower()
-            if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                method, path_kw = "send_voice", "audio_path"
-            elif ext in _VIDEO_EXTS:
-                method, path_kw = "send_video", "video_path"
-            elif ext in _IMAGE_EXTS:
-                method, path_kw = "send_image_file", "image_path"
-            else:
-                method, path_kw = "send_document", "file_path"
-            # The voice sender decides bubble vs music-file from ``is_voice`` (Telegram
-            # transcodes non-Opus only when it is set), matching the gateway dispatch
-            # in BasePlatformAdapter._send_one.
-            extra = {"is_voice": _is_voice} if method == "send_voice" else {}
-            coro = getattr(adapter, method)(
-                chat_id=chat_id, metadata=metadata, **{path_kw: media_path}, **extra)
-            future = safe_schedule_threadsafe(coro, loop)
-            if future is None:
-                _note_target_error(
-                    job_ref, f"cannot send media {media_path}: gateway loop unavailable", errors)
-                return errors
-            try:
-                # Large attachments can exceed 30s; configurable via _get_media_send_timeout().
-                result = future.result(timeout=_script._get_media_send_timeout())
-            except TimeoutError:
-                future.cancel()
-                raise
-            if result and not getattr(result, "success", True):
-                _note_target_error(
-                    job_ref,
-                    f"media send failed for {media_path}: {getattr(result, 'error', 'unknown')}",
-                    errors,
-                )
-        except Exception as e:
-            # TimeoutError etc. have an empty str(); fall back to the class name.
-            _note_target_error(
-                job_ref, f"failed to send media {media_path}: {str(e) or type(e).__name__}", errors)
-    return errors
-
-
 def _result_field(send_result, key: str, default=None):
     """Read ``key`` from a SendResult-like object or the plain dict the silence filter returns."""
     if isinstance(send_result, dict):
@@ -1121,6 +1054,7 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    force_document: bool = False  # [[as_document]]: images go unrecompressed
     live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
 
     @property
@@ -1219,6 +1153,16 @@ def _inchannel_surface_supported(runtime_adapter, platform_name: str) -> bool:
     return bool(getattr(runtime_adapter, "supports_inchannel_continuable", False))
 
 
+def _named_dm_topic(t: _TargetDelivery) -> Optional[str]:
+    """The topic NAME of a ``telegram:<positive chat id>:<topic name>`` target, else None."""
+    from gateway.config import Platform
+    from gateway.delivery import _looks_like_int, looks_like_telegram_private_chat_id
+    if (t.platform == Platform.TELEGRAM and t.thread_id is not None
+            and looks_like_telegram_private_chat_id(str(t.chat_id)) and not _looks_like_int(str(t.thread_id))):
+        return str(t.thread_id)
+    return None
+
+
 def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]:
     """Compute ``(route_thread_id, route_metadata, media_metadata)`` for a live send, ONCE so text
     and media agree. ``telegram:<positive_chat_id>:<numeric_thread_id>`` is ambiguous (private
@@ -1252,7 +1196,10 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         # key bypasses that check and lets the adapter route via a plain message_thread_id. See #52060.
         route_thread_id = str(thread_id) if thread_id is not None else None
         route_metadata = {"job_id": job["id"], "notify": t.notify_delivery}
-        if route_thread_id:
+        # A named private-DM topic stays on the target only: the router resolves the name
+        # (ensure_dm_topic) and refreshes it on "thread not found" only when metadata carries no
+        # thread routing key (#80483).
+        if route_thread_id and _named_dm_topic(t) is None:
             route_metadata["thread_id"] = route_thread_id
         media_metadata = {"notify": t.notify_delivery}
         if thread_id:
@@ -1369,8 +1316,31 @@ def _live_send_text(
     return True, False, delivered_message_id
 
 
+def _resolve_named_dm_topic(t: _TargetDelivery, topic_name: str, metadata: dict, delivery_errors: list,
+                            n_media: int, *, refresh: bool) -> bool:
+    """Resolve a named DM topic to its thread id through the router's resolver (cached by the
+    adapter, so after a text send this is the id that send used), writing it to ``t.thread_id``
+    (mirroring/seeding key on the numeric id) and ``metadata``. False = media dropped, never General."""
+    from agent.async_utils import safe_schedule_threadsafe
+    from gateway.delivery import _ensure_named_dm_topic
+    future = safe_schedule_threadsafe(
+        _ensure_named_dm_topic(t.runtime_adapter, str(t.chat_id), topic_name, refresh=refresh), t.loop)
+    try:
+        if future is None:
+            raise RuntimeError("gateway loop unavailable")
+        t.thread_id = future.result(timeout=30)
+    except Exception as e:  # any resolver/adapter failure drops the media for this target
+        logger.warning("Job '%s': named DM topic %r unresolved", t.job["id"], topic_name, exc_info=True)
+        if n_media:
+            delivery_errors.append(f"{n_media} media attachment(s) not delivered to {t.where}: {e}")
+        return False
+    metadata.update(thread_id=t.thread_id, telegram_dm_topic_created_for_send=True)
+    return True
+
+
 def _live_send_media(
-    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list) -> None:
+    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list,
+    unverified_targets: list, topic_name: Optional[str] = None) -> None:
     """Send extracted media as native attachments with the same routing as the text send."""
     routed_media_metadata = dict(media_metadata or {})
     if t.is_relay:
@@ -1383,8 +1353,17 @@ def _live_send_media(
                 routed_media_metadata["scope_id"] = logical_home.scope_id
     _media_errors = _send_media_via_adapter(
         t.runtime_adapter, t.chat_id, media_files, routed_media_metadata or None, t.loop, t.job,
-        platform=t.platform,
+        platform=t.platform, force_document=t.force_document,
     )
+    if (topic_name and len(media_files) == sum("thread not found" in e.lower() for e in _media_errors)
+            and _resolve_named_dm_topic(t, topic_name, routed_media_metadata, delivery_errors,
+                                        len(media_files), refresh=True)):
+        # The named topic vanished (a media-only job never runs the router's text refresh): recreate once.
+        _media_errors = _send_media_via_adapter(
+            t.runtime_adapter, t.chat_id, media_files, routed_media_metadata, t.loop, t.job,
+            platform=t.platform, force_document=t.force_document)
+    if t.job.pop("_media_ack_lost", False) and t.where not in unverified_targets:
+        unverified_targets.append(t.where)
     # Surface per-file failures into run status: text delivered but attachment lost is not ok.
     for _me in _media_errors:
         delivery_errors.append(f"{_me} (target {t.where})")
@@ -1475,8 +1454,11 @@ def _deliver_via_live_adapter(
         # gateway loop is contended, so each media send would also block its 30s budget, and the text
         # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
         # visible rather than silently lost.
+        if (topic_name := _named_dm_topic(t)) is not None and adapter_ok and not timed_out:
+            adapter_ok = _resolve_named_dm_topic(
+                t, topic_name, media_metadata, delivery_errors, len(media_files), refresh=False) or bool(text_to_send)
         if adapter_ok and not timed_out and media_files:
-            _live_send_media(t, media_metadata, media_files, delivery_errors)
+            _live_send_media(t, media_metadata, media_files, delivery_errors, unverified_targets, topic_name)
         elif timed_out and media_files:
             _note_target_error(
                 job,
@@ -1512,14 +1494,16 @@ def _standalone_send(
     job = t.job
     shutdown_msg = f"delivery to {t.where} skipped — interpreter is shutting down"
 
-    send_timeout = _get_standalone_send_timeout()
+    send_timeout = _script._media_scaled_timeout(base_timeout := _get_standalone_send_timeout(), media_files)
 
     async def _send():
         # The bound lives inside the coroutine: the running-loop fallback below closes ``coro``
         # unstarted, and a wait_for wrapper created out here would be left never awaited.
+        # notify: the live lane's metadata["notify"] (cron.delivery.notify), so a brief rings either way.
         return await asyncio.wait_for(_send_to_platform(
             t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files), timeout=send_timeout)
+            media_files=media_files, notify=t.notify_delivery, force_document=t.force_document),
+            timeout=send_timeout)
 
     def _warned(msg: str) -> tuple[None, str]:
         logger.warning("Job '%s': %s", job["id"], msg)
@@ -1544,7 +1528,7 @@ def _standalone_send(
     except TimeoutError:
         # The send may still complete on the gateway loop (the dispatch shield keeps an in-flight
         # send un-cancelled); the run is released instead of waiting on it unbounded (#115469).
-        msg = (f"standalone send to {t.where} timed out after {send_timeout}s "
+        msg = (f"standalone send to {t.where} timed out after {send_timeout:g}s "
                "(the send may still be in flight)")
         logger.error("Job '%s': %s", job["id"], msg)
         return None, msg
@@ -1560,7 +1544,7 @@ def _standalone_send(
                 # A fresh thread does NOT inherit the profile ContextVars (home override + secret
                 # scope); run in the active context or the sender reads the default bot token.
                 return pool.submit(contextvars.copy_context().run, asyncio.run, _send()).result(
-                    timeout=30), None
+                    timeout=30 + send_timeout - base_timeout), None
             finally:
                 pool.shutdown(wait=False)
         except Exception as e:
@@ -1788,7 +1772,7 @@ def _deliver_result(
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
     if (external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
-            and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
+            and any(target["platform"] not in (BOT_CHAT_PLATFORM, ROOM_PLATFORM) for target in targets)):
         from cron.delivery_queue import enqueue_and_wait
 
         _record_delivery_verification(job, [])
@@ -1892,6 +1876,11 @@ def _deliver_result(
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
             continue
+        if target["platform"] == ROOM_PLATFORM:
+            room_error = deliver_to_room(job, content, target["chat_id"], for_failure=for_failure)
+            if room_error:
+                delivery_errors.append(room_error)
+            continue
         if target["platform"] == "local":
             from gateway.session_cron import deliver_to_local_chat
             from hermes_constants import get_hermes_home
@@ -1907,6 +1896,7 @@ def _deliver_result(
             mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
         if t is None:
             continue
+        t.force_document = "[[as_document]]" in content  # the job output, never the wrapped job name
         target_errors: list = []
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,
@@ -1930,6 +1920,9 @@ def _deliver_result(
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
 from cron import scheduler as _sched
+from cron.scheduler_delivery_room import (
+    ROOM_PLATFORM, deliver_to_room, parse_room_deliver_token, resolve_room_target)
 from cron import scheduler_delivery_origin as _origin
+from cron.scheduler_delivery_media import _send_media_via_adapter
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
