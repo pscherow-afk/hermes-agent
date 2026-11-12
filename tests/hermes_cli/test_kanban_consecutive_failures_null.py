@@ -26,6 +26,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_db_graph import decompose_triage_task
 
 
 @pytest.fixture
@@ -77,3 +78,25 @@ def test_record_task_failure_tolerates_null_consecutive_failures(conn):
         "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,)
     ).fetchone()
     assert post["consecutive_failures"] == 1
+
+
+def test_decomposed_child_sets_consecutive_failures_to_zero(conn):
+    """The decomposition path (dispatcher auto-decompose, ``kanban decompose``,
+    orchestrator fan-out) inserts children via ``_insert_decomposed_child`` — a
+    SEPARATE INSERT from ``create_task``. It must also write an explicit
+    ``consecutive_failures = 0``; the previous fix covered only ``create_task``,
+    so decomposed children landed with NULL and crashed the dispatcher on the
+    first failure. This pins the uncovered path."""
+    root = kb.create_task(conn, title="root", assignee="w", triage=True)
+    child_ids = decompose_triage_task(
+        conn, root, root_assignee="w",
+        children=[{"title": "child-1", "assignee": "w"}], author="tester",
+    )
+    assert child_ids, "decompose should create at least one child"
+    for cid in child_ids:
+        row = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id = ?", (cid,)
+        ).fetchone()
+        assert row is not None
+        assert row["consecutive_failures"] is not None, "child must not be NULL"
+        assert row["consecutive_failures"] == 0
